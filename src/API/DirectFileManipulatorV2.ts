@@ -112,6 +112,12 @@ export class DirectFileManipulator implements LiveSyncLocalDBEnv {
     services: HeadlessServiceHub<ServiceContext>;
     public async init() {
         await this.services.appLifecycle.onReady();
+        // Wire up _localDatabase on the database service before initialisation.
+        // Normally DatabaseService.openDatabase() sets this, but the bridge
+        // bypasses that flow. Without it, LiveSyncManagers.getManagerMembers()
+        // throws "Local database is not ready yet" when accessing
+        // databaseService.localDatabase.
+        (this.services.database as any)._localDatabase = this.liveSyncLocalDB;
         await this.liveSyncLocalDB.initializeDatabase();
         this.ready.resolve();
         this.liveSyncLocalDB.refreshSettings();
@@ -139,6 +145,15 @@ export class DirectFileManipulator implements LiveSyncLocalDBEnv {
             database: this.getBoundDatabaseService(() => this.options),
         });
 
+        // Wire up addLog before any initialisation — LiveSyncManagers calls
+        // this.log() during construction (upstream refactor 29f2a6a), which
+        // invokes APIService.addLog. Without this assignment the Binder throws
+        // "Handler addLog is not assigned".
+        this.services.API.addLog.setHandler((message: any, level?: any, key?: string) => {
+            Logger(message, level, key);
+        });
+        this.services.API.getSystemVaultName.setHandler(() => "headless-vault");
+
         // (this.services.setting as InjectableSettingService<ServiceContext>).currentSettings.setHandler(
         //     getSettings.bind(this)
         // );
@@ -150,6 +165,12 @@ export class DirectFileManipulator implements LiveSyncLocalDBEnv {
             console.warn("Loading settings is not supported in DirectFileManipulator.");
             return Promise.resolve(getSettings());
         });
+        // Pre-wire _settings so that currentSettings() returns a valid object.
+        // Without this, LiveSyncManagers → HashManagerCore.applyOptions() crashes
+        // with "Cannot read properties of undefined (reading 'encrypt')" because
+        // the bridge never calls loadSettings().
+        (this.services.setting as any)._settings = this.settings;
+
         // this.services.database.createPouchDBInstance.setHandler(this.$$createPouchDBInstance.bind(this));
         this.services.databaseEvents.onDatabaseInitialisation.addHandler(this.$everyOnInitializeDatabase.bind(this));
         this.liveSyncLocalDB = new LiveSyncLocalDB(this.options.url, this);

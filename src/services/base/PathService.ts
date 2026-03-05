@@ -80,6 +80,9 @@ export abstract class PathService<T extends ServiceContext = ServiceContext>
     async path2id(filename: FilePathWithPrefix | FilePath, prefix?: string): Promise<DocumentID> {
         const destPath = addPrefix(filename, prefix ?? "");
         const setting = this.settings;
+        if (!setting) {
+            throw new Error("PathService.path2id: settings not yet initialised — caller must wait for readiness");
+        }
         return await this._path2id(
             destPath,
             setting.usePathObfuscation ? setting.passphrase : "",
