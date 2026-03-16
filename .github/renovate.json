@@ -1,0 +1,43 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "github>sm-moshi/infra//.github/renovate/base.json",
+    "config:best-practices",
+    ":preserveSemverRanges"
+  ],
+  "platformAutomerge": false,
+  "dependencyDashboard": true,
+  "dependencyDashboardApproval": true,
+  "dependencyDashboardAutoclose": true,
+  "timezone": "Europe/Berlin",
+  "schedule": [
+    "at any time"
+  ],
+  "prHourlyLimit": 5,
+  "prConcurrentLimit": 3,
+  "enabledManagers": [
+    "npm",
+    "github-actions"
+  ],
+  "labels": [
+    "dependencies"
+  ],
+  "packageRules": [
+    {
+      "matchManagers": [
+        "npm"
+      ],
+      "addLabels": [
+        "npm"
+      ]
+    },
+    {
+      "matchManagers": [
+        "github-actions"
+      ],
+      "addLabels": [
+        "ci"
+      ]
+    }
+  ]
+}
