@@ -152,7 +152,8 @@ export class DirectFileManipulator implements LiveSyncLocalDBEnv {
         this.services.API.addLog.setHandler((message: any, level?: any, key?: string) => {
             Logger(message, level, key);
         });
-        this.services.API.getSystemVaultName.setHandler(() => "headless-vault");
+        // getSystemVaultName is a concrete method on HeadlessAPIService since 0.25.54
+        // (deriveSystemVaultName falls back to "headless-vault" with bare ServiceContext)
 
         // (this.services.setting as InjectableSettingService<ServiceContext>).currentSettings.setHandler(
         //     getSettings.bind(this)
