@@ -5,8 +5,7 @@ import {
     joinRoom,
     type BaseRoomConfig,
     type RelayConfig,
-    type TurnConfig,
-} from "trystero/nostr";
+} from "@trystero-p2p/nostr";
 import { LOG_LEVEL_INFO, LOG_LEVEL_NOTICE, type P2PSyncSetting } from "../../common/types";
 import { LOG_LEVEL_VERBOSE, Logger } from "../../common/logger";
 import {
@@ -30,6 +29,8 @@ import { EVENT_PLATFORM_UNLOADED } from "@lib/events/coreEvents";
 import { $msg } from "../../common/i18n";
 import { shareRunningResult } from "octagonal-wheels/concurrency/lock_v2";
 import { Computed } from "octagonal-wheels/dataobject/Computed";
+import { RpcRoom, type RpcWireMessage, type TransportAdapter } from "@lib/rpc";
+import { toRpcMethodName } from "./rpcCompat";
 
 export type PeerInfo = Advertisement & {
     isAccepted: boolean | undefined;
@@ -84,6 +85,7 @@ export class TrysteroReplicatorP2PServer {
     assignedFunctions = new Map<string, (...args: any[]) => any>();
     clients: Map<string, TrysteroReplicatorP2PClient> = new Map();
     _bindingObjects: BindableObject<any>[] = [];
+    _rpcRoom?: RpcRoom;
 
     get isDisposed() {
         return !this._room;
@@ -116,6 +118,8 @@ export class TrysteroReplicatorP2PServer {
         try {
             await this.close();
             await this.ensureLeaved();
+            this._rpcRoom?.close();
+            this._rpcRoom = undefined;
         } catch (ex) {
             Logger(`Some error has been occurred while shutting down the server`, LOG_LEVEL_INFO);
             Logger(ex, LOG_LEVEL_VERBOSE);
@@ -245,7 +249,6 @@ export class TrysteroReplicatorP2PServer {
         Logger(`Advertisement from ${peerId}`, LOG_LEVEL_VERBOSE);
         if (peerId === this.serverPeerId) return;
         if (data.peerId === this.serverPeerId) return;
-        if (data.name === this.deviceInfo.name) return;
         if (data.peerId !== peerId) return;
         this._knownAdvertisements.set(peerId, data);
         void this.dispatchConnectionStatus();
@@ -388,13 +391,36 @@ You can chose as follows:
         Logger(`Initializing...`, LOG_LEVEL_VERBOSE);
         const room = this.room;
         if (!room) throw new Error("This server has been already disconnected");
-        const [send, arrived] = room.makeAction<Payload>("rpc");
-        this.___send = send;
-        arrived((data, peerId) => {
-            this.processArrivedRPC(data, peerId).catch((e) => {
-                Logger(e.message, LOG_LEVEL_INFO);
-                Logger(e, LOG_LEVEL_VERBOSE);
-            });
+        const [sendRpc, arrivedRpc] = room.makeAction<RpcWireMessage>("rpc2");
+        const transport: TransportAdapter = {
+            send: (message, peerId) => {
+                return sendRpc(message, peerId).then(() => undefined);
+            },
+            onMessage: (handler) => {
+                arrivedRpc((data, peerId) => {
+                    handler(data, peerId);
+                });
+                return () => undefined;
+            },
+            onPeerJoin: (handler) => {
+                room.onPeerJoin((peerId) => handler(peerId));
+                return () => undefined;
+            },
+            onPeerLeave: (handler) => {
+                room.onPeerLeave((peerId) => handler(peerId));
+                return () => undefined;
+            },
+        };
+        this._rpcRoom?.close();
+        this._rpcRoom = new RpcRoom({
+            transport,
+            canAcceptRequest: async (peerId, method) => {
+                if (method === toRpcMethodName("!reqAuth")) return true;
+                return (await this.isAcceptablePeer(peerId)) === true;
+            },
+            onProtocolWarning: (message, peerId) => {
+                Logger(`RPC Protocol warning${peerId ? ` from ${peerId}` : ""}: ${message}`, LOG_LEVEL_VERBOSE);
+            },
         });
         const [adSend, adArrived] = room.makeAction<Advertisement>("ad");
 
@@ -449,11 +475,14 @@ You can chose as follows:
         const turnServers = this.settings.P2P_turnServers.split(",")
             .map((e) => e.trim())
             .filter((e) => e.length > 0);
+        const rtcPolyfill = (globalThis as any).RTCPeerConnection;
 
         const options = {
             relayUrls: relays,
             appId: this.settings.P2P_AppID,
             password: passphrase,
+            manualRelayReconnection: true,
+            ...(typeof rtcPolyfill === "function" ? { rtcPolyfill } : {}),
             turnConfig:
                 turnServers.length > 0
                     ? [
@@ -464,8 +493,8 @@ You can chose as follows:
                           },
                       ]
                     : [],
-        } satisfies BaseRoomConfig & RelayConfig & TurnConfig;
-        const room = joinRoom(options, this.settings.P2P_roomID, true);
+        } satisfies BaseRoomConfig & RelayConfig;
+        const room = joinRoom(options, this.settings.P2P_roomID);
         await this.setRoom(room);
         this.onAfterJoinRoom();
         void this.dispatchConnectionStatus();
@@ -475,6 +504,9 @@ You can chose as follows:
     serveFunction<T extends any[], U>(type: string, func: (...args: T) => U | Promise<U>) {
         // Logger(`Serving function: ${type}`, LOG_LEVEL_VERBOSE);
         this.assignedFunctions.set(type, func);
+        this._rpcRoom?.register(toRpcMethodName(type), async (peerId, ...args) => {
+            return (await Promise.resolve(func.apply(this, [peerId, ...args] as any))) as any;
+        });
     }
     serveObject<T>(obj: BindableObject<T>) {
         const keys = Object.keys(obj) as (keyof BindableObject<T>)[];
@@ -483,6 +515,9 @@ You can chose as follows:
             const func = (obj[key] as (...args: any[]) => any).bind(obj);
             // Logger(`Serving function: ${key.toString()}`, LOG_LEVEL_VERBOSE);
             this.assignedFunctions.set(key.toString(), func);
+            this._rpcRoom?.register(toRpcMethodName(key.toString()), async (_peerId, ...args) => {
+                return await Promise.resolve(func(...args));
+            });
         });
     }
 
@@ -522,6 +557,8 @@ You can chose as follows:
         const peers = this.room?.getPeers() ?? {};
         this.clients.forEach((client) => client.close());
         this.clients.clear();
+        this._rpcRoom?.close();
+        this._rpcRoom = undefined;
         for (const [, peer] of Object.entries(peers)) {
             peer.close();
         }
@@ -540,6 +577,10 @@ You can chose as follows:
         const client = new TrysteroReplicatorP2PClient(this, peerId);
         this.clients.set(peerId, client);
         return client;
+    }
+
+    get rpcRoom() {
+        return this._rpcRoom;
     }
 }
 
