@@ -83,7 +83,7 @@ export abstract class DatabaseService<T extends ServiceContext = ServiceContext>
     ): PouchDB.Database<T> {
         const settings = this.services.setting.currentSettings();
         const optionPass = this.modifyDatabaseOptions(settings, name ?? "", options ?? {});
-        return new PouchDB(optionPass.name, optionPass.options);
+        return new PouchDB(optionPass.name, optionPass.options as any) as unknown as PouchDB.Database<T>;
     }
 
     async openDatabase(params: openDatabaseParameters): Promise<boolean> {
