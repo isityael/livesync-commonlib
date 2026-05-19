@@ -121,7 +121,6 @@ const ENCRYPTION_HKDF_FAILED = "Encryption with HKDF failed.";
 const DECRYPTION_HKDF_FAILED = "Decryption with HKDF failed.";
 const DECRYPTION_FALLBACK_FAILED = "Decryption with fallback failed.";
 
-// requires transform-pouch
 async function incomingEncryptHKDF(
     doc: AnyEntry | EntryLeaf,
     passphrase: string,
@@ -316,7 +315,6 @@ async function outgoingDecryptHKDF(
     }
     return loadDoc;
 }
-// requires transform-pouch
 async function incomingEncryptV1(
     doc: AnyEntry | EntryLeaf,
     passphrase: string,

@@ -132,7 +132,7 @@ export class DirectFileManipulator implements LiveSyncLocalDBEnv {
                 const option = _option();
                 return new PouchDB(option.url + "/" + option.database, {
                     auth: { username: option.username, password: option.password },
-                });
+                }) as unknown as PouchDB.Database<T>;
             }
         };
     }

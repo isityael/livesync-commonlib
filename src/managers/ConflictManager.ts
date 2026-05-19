@@ -1,4 +1,3 @@
-import { type Diff, diff_match_patch, DIFF_DELETE, DIFF_INSERT, DIFF_EQUAL } from "diff-match-patch";
 import { readString, decodeBinary } from "octagonal-wheels/binary";
 import { Logger, LOG_LEVEL_VERBOSE, LOG_LEVEL_INFO } from "octagonal-wheels/common/logger";
 import {
@@ -22,6 +21,7 @@ import {
 import type { EntryManager } from "../managers/EntryManager/EntryManager.ts";
 import { isErrorOfMissingDoc } from "../pouchdb/utils_couchdb.ts";
 import type { IPathService } from "../services/base/IService.ts";
+import { type Diff, diffLinesAsTuples, DIFF_DELETE, DIFF_EQUAL, DIFF_INSERT } from "./lineDiff.ts";
 
 type AutoMergeOutcomeOK = {
     ok: DIFF_CHECK_RESULT_AUTO;
@@ -97,13 +97,8 @@ export class ConflictManager {
             return false;
         }
         // diff between base and each revision
-        const dmp = new diff_match_patch();
-        const mapLeft = dmp.diff_linesToChars_(baseLeaf.data, leftLeaf.data);
-        const diffLeftSrc = dmp.diff_main(mapLeft.chars1, mapLeft.chars2, false);
-        dmp.diff_charsToLines_(diffLeftSrc, mapLeft.lineArray);
-        const mapRight = dmp.diff_linesToChars_(baseLeaf.data, rightLeaf.data);
-        const diffRightSrc = dmp.diff_main(mapRight.chars1, mapRight.chars2, false);
-        dmp.diff_charsToLines_(diffRightSrc, mapRight.lineArray);
+        const diffLeftSrc = diffLinesAsTuples(baseLeaf.data, leftLeaf.data);
+        const diffRightSrc = diffLinesAsTuples(baseLeaf.data, rightLeaf.data);
         function splitDiffPiece(src: Diff[]): Diff[] {
             const ret = [] as Diff[];
             do {
