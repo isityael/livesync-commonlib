@@ -270,7 +270,7 @@ export abstract class RemoteService<T extends ServiceContext = ServiceContext>
             },
         };
         const setting = this._settingService.currentSettings();
-        const db: PouchDB.Database<EntryDoc> = new PouchDB<EntryDoc>(uri, conf);
+        const db = new PouchDB<EntryDoc>(uri, conf as any) as unknown as PouchDB.Database<EntryDoc>;
         replicationFilter(db, compression);
         disableEncryption();
         if (passphrase !== "false" && typeof passphrase === "string") {
