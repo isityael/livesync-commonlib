@@ -39,6 +39,7 @@ declare global {
         [EVENT_FILE_SAVED]: undefined;
         [EVENT_SETTING_SAVED]: ObsidianLiveSyncSettings;
         [EVENT_LAYOUT_READY]: undefined;
+        [EVENT_PLUGIN_UNLOADED]: undefined;
         [EVENT_FILE_CHANGED]: { file: FilePathWithPrefix; automated: boolean };
         [EVENT_DOCUMENT_STUB_CREATED]: {
             toc: Set<string>;
@@ -47,6 +48,7 @@ declare global {
         [EVENT_FILE_RENAMED]: { newPath: FilePathWithPrefix; old: FilePathWithPrefix };
 
         [EVENT_DATABASE_REBUILT]: undefined;
+        [EVENT_REQUEST_RELOAD_SETTING_TAB]: undefined;
         [EVENT_REQUEST_OPEN_P2P_SETTINGS]: undefined;
         [EVENT_REQUEST_SHOW_SETUP_QR]: undefined;
         [EVENT_REQUEST_OPEN_P2P]: undefined;
