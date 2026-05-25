@@ -46,7 +46,10 @@ export function splitPieces2Worker(
     filename?: string,
     useSegmenter?: boolean
 ) {
-    return splitPieces2(dataSrc, pieceSize, plainSplit, minimumChunkSize, filename, useSegmenter ?? false);
+    return async function* () {
+        const splitter = await splitPieces2(dataSrc, pieceSize, plainSplit, minimumChunkSize, filename, useSegmenter ?? false);
+        yield* splitter();
+    };
 }
 export function splitPieces2WorkerV2(
     dataSrc: Blob,
@@ -56,7 +59,10 @@ export function splitPieces2WorkerV2(
     filename?: string,
     useSegmenter?: boolean
 ) {
-    return splitPieces2V2(dataSrc, pieceSize, plainSplit, minimumChunkSize, filename, useSegmenter ?? false);
+    return async function* () {
+        const splitter = await splitPieces2V2(dataSrc, pieceSize, plainSplit, minimumChunkSize, filename, useSegmenter ?? false);
+        yield* splitter();
+    };
 }
 export function splitPieces2WorkerRabinKarp(
     dataSrc: Blob,

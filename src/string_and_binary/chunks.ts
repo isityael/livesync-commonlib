@@ -93,7 +93,7 @@ function* splitStringWithinLength(text: string, pieceSize: number) {
 }
 
 function* splitTextInSegment(text: string, pieceSize: number, minimumChunkSize: number) {
-    const segments = segmenter!.segment(text) as [{ segment: string }];
+    const segments = segmenter!.segment(text) as unknown as Iterable<{ segment: string }>;
 
     let prev = "";
     let buf = "";

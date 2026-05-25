@@ -11,7 +11,7 @@ interface ErrorWithCause extends Error {
  */
 export class LiveSyncError extends Error implements ErrorWithCause {
     override name = this.constructor.name;
-    cause?: Error;
+    override cause?: Error;
     overrideStatus?: number;
     /**
      * Returns the HTTP status code associated with the error, if available.
