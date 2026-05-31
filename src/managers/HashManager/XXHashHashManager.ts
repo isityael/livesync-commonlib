@@ -1,6 +1,5 @@
 import { HashManagerCore, type HashManagerCoreOptions } from "./HashManagerCore.ts";
-import { xxhashNew } from "@lib/string_and_binary/hash.ts";
-import type { XXHashAPI } from "xxhash-wasm-102";
+import { type XXHashAPI, xxhashNew } from "@lib/string_and_binary/hash.ts";
 import { HashAlgorithms } from "@lib/common/models/setting.const.ts";
 import type { HashAlgorithm } from "@lib/common/models/setting.type.ts";
 
