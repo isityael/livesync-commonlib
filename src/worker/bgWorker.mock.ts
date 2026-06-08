@@ -113,8 +113,17 @@ export function startWorker(data: Omit<EncryptHKDFArguments, "key">): EncryptHKD
 export function startWorker(data: Omit<EncryptArguments, "key">): EncryptProcessItem;
 export function startWorker(data: Omit<SplitArguments, "key">): SplitProcessItem;
 export function startWorker(data: Omit<EncryptArguments | SplitArguments | EncryptHKDFArguments, "key">): ProcessItem {
-    const task = promiseWithResolvers<string | null>();
-    task.resolve();
+    if (data.type === "split") {
+        return {
+            key: 0,
+            type: data.type,
+            finalize: () => {
+                // No op
+            },
+        };
+    }
+    const task = promiseWithResolvers<string>();
+    task.resolve("");
     return {
         task: task,
         key: 0,
