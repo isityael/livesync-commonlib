@@ -1,11 +1,12 @@
 import { EVENT_SETTING_SAVED } from "@lib/events/coreEvents";
-import type { ServiceContext } from "../../base/ServiceBase";
-import { SettingService, type SettingServiceDependencies } from "../../base/SettingService";
+import type { ServiceContext } from "@lib/services/base/ServiceBase";
+import { SettingService, type SettingServiceDependencies } from "@lib/services/base/SettingService";
 import { EVENT_REQUEST_RELOAD_SETTING_TAB } from "@/common/events";
 
 import { eventHub } from "@lib/hub/hub";
 import type { ObsidianLiveSyncSettings } from "@lib/common/types";
-import { handlers } from "../../lib/HandlerUtils";
+import { handlers } from "@lib/services/lib/HandlerUtils";
+import { compatGlobal } from "@lib/common/coreEnvFunctions";
 
 export class InjectableSettingService<T extends ServiceContext> extends SettingService<T> {
     constructor(context: T, dependencies: SettingServiceDependencies) {
@@ -20,13 +21,13 @@ export class InjectableSettingService<T extends ServiceContext> extends SettingS
         });
     }
     protected setItem(key: string, value: string) {
-        return localStorage.setItem(key, value);
+        return compatGlobal.localStorage.setItem(key, value);
     }
     protected getItem(key: string): string {
-        return localStorage.getItem(key) ?? "";
+        return compatGlobal.localStorage.getItem(key) ?? "";
     }
     protected deleteItem(key: string): void {
-        localStorage.removeItem(key);
+        compatGlobal.localStorage.removeItem(key);
     }
 
     // override currentSettings = handlers<SettingService<T>>().binder("currentSettings");

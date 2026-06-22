@@ -10,11 +10,11 @@ type ExtractPropertiesByType<T, U> = {
     [K in keyof T as T[K] extends U ? K : never]: T[K] extends U ? K : never;
 };
 
-export type FilterStringKeys<T> = keyof ExtractPropertiesByType<T, string | (string | undefined)>;
+export type FilterStringKeys<T> = keyof ExtractPropertiesByType<T, string | undefined>;
 
-export type FilterBooleanKeys<T> = keyof ExtractPropertiesByType<T, boolean | (boolean | undefined)>;
+export type FilterBooleanKeys<T> = keyof ExtractPropertiesByType<T, boolean | undefined>;
 
-export type FilterNumberKeys<T> = keyof ExtractPropertiesByType<T, number | (number | undefined)>;
+export type FilterNumberKeys<T> = keyof ExtractPropertiesByType<T, number | undefined>;
 
 import type { FilePath, FilePathWithPrefixLC, FilePathWithPrefix, DocumentID } from "./models/db.type.ts";
 
@@ -131,6 +131,10 @@ export const SettingInformation: Partial<Record<keyof AllSettings, Configuration
         name: "Sync on Editor Save",
         desc: "When you save a file in the editor, start a sync automatically",
     },
+    keepReplicationActiveInBackground: {
+        name: "Keep replication active in the background",
+        desc: "Desktop only; uses more battery and network.",
+    },
     syncOnFileOpen: {
         name: "Sync on File Open",
         desc: "Forces the file to be synced when opened.",
@@ -145,7 +149,7 @@ export const SettingInformation: Partial<Record<keyof AllSettings, Configuration
     },
     trashInsteadDelete: {
         name: "Use the trash bin",
-        desc: "Move remotely deleted files to the trash, instead of deleting.",
+        desc: "Move remotely deleted files to the trash, instead of deleting. (This setting is ineffective from Obsidian v1.7.2 onwards, as deletion always respects your Obsidian preferences.)",
     },
     doNotDeleteFolder: {
         name: "Keep empty folder",
@@ -387,8 +391,8 @@ export const SettingInformation: Partial<Record<keyof AllSettings, Configuration
         name: "Enable edge case treatment features",
     },
     enableDebugTools: {
-        name: "Enable Developers' Debug Tools.",
-        desc: "While enabled, it causes very performance impact but debugging replication testing and other features will be enabled. Please disable this if you have not read the source code. Requires restart of Obsidian.",
+        name: "Enable Developers' Debug Tools (If available).",
+        desc: "While enabled, it causes very performance impact but debugging replication testing and other features will be enabled. Please disable this if you have not read the source code. Requires restart of Obsidian. Sometimes there is no implementation.",
     },
     suppressNotifyHiddenFilesChange: {
         name: "Suppress notification of hidden files change",

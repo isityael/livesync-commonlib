@@ -2,8 +2,9 @@ import type { FetchHttpHandler } from "@smithy/fetch-http-handler";
 import type { LOG_LEVEL } from "@lib/common/logger";
 import type { IAPIService, ICommandCompat } from "./IService";
 import { ServiceBase, type ServiceContext } from "./ServiceBase";
-import type { Confirm } from "../../interfaces/Confirm";
+import type { Confirm } from "@lib/interfaces/Confirm";
 import { reactiveSource } from "octagonal-wheels/dataobject/reactive";
+import { _fetch, compatGlobal } from "@lib/common/coreEnvFunctions";
 /**
  * The APIService provides methods for interacting with the plug-in's API,
  */
@@ -22,7 +23,7 @@ export abstract class APIService<T extends ServiceContext = ServiceContext>
      * @param level The log level.
      * @param key The log key.
      */
-    abstract addLog(message: any, level: LOG_LEVEL, key: string): void;
+    abstract addLog(message: unknown, level: LOG_LEVEL, key: string): void;
 
     /**
      * Check if the app is running on a mobile device.
@@ -35,6 +36,14 @@ export abstract class APIService<T extends ServiceContext = ServiceContext>
      * @param type The type of window to show.
      */
     abstract showWindow(type: string): Promise<void>;
+
+    /**
+     * Show a window on the right sidebar when supported.
+     * Platforms that do not support sidebars can fall back to showWindow.
+     */
+    showWindowOnRight(type: string): Promise<void> {
+        return this.showWindow(type);
+    }
 
     /**
      * returns App ID. In Obsidian, it is vault ID.
@@ -69,7 +78,7 @@ export abstract class APIService<T extends ServiceContext = ServiceContext>
      * @param type
      * @param factory
      */
-    abstract registerWindow(type: string, factory: (leaf: any) => any): void;
+    abstract registerWindow<T>(type: string, factory: (leaf: T) => unknown): void;
 
     /**
      * Add a ribbon icon to the UI.
@@ -77,14 +86,14 @@ export abstract class APIService<T extends ServiceContext = ServiceContext>
      * @param title
      * @param callback
      */
-    abstract addRibbonIcon(icon: string, title: string, callback: (evt: MouseEvent) => any): HTMLElement;
+    abstract addRibbonIcon(icon: string, title: string, callback: (evt: MouseEvent) => unknown): HTMLElement;
 
     /**
      * Register a protocol handler.
      * @param action The action string for the protocol.
      * @param handler The handler function for the protocol.
      */
-    abstract registerProtocolHandler(action: string, handler: (params: Record<string, string>) => any): void;
+    abstract registerProtocolHandler(action: string, handler: (params: Record<string, string>) => unknown): void;
 
     /**
      * Get the basic UI component for showing a confirmation dialog to the user.
@@ -94,14 +103,14 @@ export abstract class APIService<T extends ServiceContext = ServiceContext>
     responseCount = reactiveSource(0);
 
     get isOnline() {
-        if ("navigator" in globalThis) {
-            return navigator.onLine;
+        if ("navigator" in compatGlobal) {
+            return compatGlobal.navigator.onLine;
         }
         return true;
     }
 
     webCompatFetch(req: string | Request, opts?: RequestInit): Promise<Response> {
-        return fetch(req, opts);
+        return _fetch(req, opts);
     }
 
     // By default, nativeFetch is not implemented. It can be overridden by platforms that support it (e.g., ObsidianAPIService).
@@ -112,11 +121,11 @@ export abstract class APIService<T extends ServiceContext = ServiceContext>
     abstract addStatusBarItem(): HTMLElement | undefined;
 
     setInterval(handler: () => void, timeout: number): number {
-        return globalThis.setInterval(handler, timeout) as unknown as number;
+        return compatGlobal.setInterval(handler, timeout);
     }
 
     clearInterval(timerId: number): void {
-        globalThis.clearInterval(timerId);
+        compatGlobal.clearInterval(timerId);
     }
 
     /**

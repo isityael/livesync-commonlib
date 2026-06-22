@@ -1,6 +1,6 @@
 <script lang="ts">
-    import type { DialogHostProps } from "../services/implements/base/SvelteDialog";
-    import { type DialogSvelteComponentBaseProps, type ComponentHasResult } from "./svelteDialog";
+    import type { DialogHostProps } from "@lib/services/implements/base/SvelteDialog";
+    import { type DialogSvelteComponentBaseProps } from "./svelteDialog";
     // type Props = DialogSvelteComponentBaseProps & {
     //     /**
     //      * The Svelte component to mount inside the dialog host
@@ -19,7 +19,7 @@
         closeDialog,
         setResult,
         getInitialData,
-    } as DialogSvelteComponentBaseProps;
+    } satisfies DialogSvelteComponentBaseProps<any,any>
 
     // Call the onSetupContext function to setup the dialog context
     onSetupContext?.(contextProps);

@@ -1,5 +1,34 @@
+import type { Constructor } from "@lib/common/utils.type";
 interface ErrorWithCause extends Error {
     cause?: unknown;
+}
+
+function getStatusFromError(error: unknown): number | undefined {
+    if (error && typeof error === "object") {
+        if ("status" in error && typeof error.status === "number") {
+            return error.status;
+        }
+        if ("cause" in error) {
+            return getStatusFromError(error.cause);
+        }
+    }
+    return 500; // Default status code for internal server error if no status found in the cause chain
+}
+
+function getMessageFromError(error: unknown): string {
+    if (error instanceof Error) {
+        return error.message;
+    }
+    if (typeof error === "object" && error !== null) {
+        return JSON.stringify(error);
+    }
+    return String(error);
+}
+function getErrorCause(error: unknown): unknown {
+    if (error && typeof error === "object" && "cause" in error) {
+        return (error as { cause?: unknown }).cause;
+    }
+    return undefined;
 }
 
 /**
@@ -11,7 +40,7 @@ interface ErrorWithCause extends Error {
  */
 export class LiveSyncError extends Error implements ErrorWithCause {
     override name = this.constructor.name;
-    override cause?: Error;
+    cause?: Error | object | string;
     overrideStatus?: number;
     /**
      * Returns the HTTP status code associated with the error, if available.
@@ -22,8 +51,11 @@ export class LiveSyncError extends Error implements ErrorWithCause {
         if (this.overrideStatus !== undefined) {
             return this.overrideStatus;
         }
-        if (this.cause && "status" in this.cause) {
-            return this.cause.status as number;
+        if (this.cause) {
+            const status = getStatusFromError(this.cause);
+            if (status !== undefined) {
+                return status;
+            }
         }
         return 500; // Default status code for internal server error
     }
@@ -34,7 +66,11 @@ export class LiveSyncError extends Error implements ErrorWithCause {
     constructor(message: string, options?: { cause?: unknown; status?: number }) {
         super(message);
         if (options?.cause) {
-            this.cause = options.cause instanceof Error ? options.cause : new Error(`${options.cause}`);
+            const actualCause = getErrorCause(options);
+            this.cause =
+                actualCause instanceof Error
+                    ? actualCause
+                    : new Error(`Unknown cause: ${getMessageFromError(actualCause)}`);
         }
         if (options?.status !== undefined) {
             this.overrideStatus = options.status;
@@ -49,15 +85,20 @@ export class LiveSyncError extends Error implements ErrorWithCause {
      * @example
      * LiveSyncError.isCausedBy(someSyncParamsFetchError, SyncParamsNotFoundError); // Returns true if the error is caused by SyncParamsNotFoundError; this is usually represented as SyncParamsFetchError at the uppermost layer.
      */
-    static isCausedBy<T extends LiveSyncError>(error: any, errorClass: new (...args: any[]) => T): boolean {
+    static isCausedBy<T extends LiveSyncError>(error: unknown, errorClass: Constructor<T>): boolean {
         if (!error) {
             return false;
         }
         if (error instanceof errorClass) {
             return true;
         }
-        if (error.cause) {
-            return LiveSyncError.isCausedBy(error.cause, errorClass);
+        if (typeof error === "object" && !!error && "cause" in error) {
+            const cause = getErrorCause(error);
+            if (cause === error) {
+                // Avoid infinite loop in case of circular cause reference.
+                return false;
+            }
+            return LiveSyncError.isCausedBy(cause, errorClass);
         }
         return false;
     }
@@ -66,12 +107,15 @@ export class LiveSyncError extends Error implements ErrorWithCause {
      * @param error The error to wrap.
      * @returns A new instance of the error class with the original error's message and stack trace.
      */
-    static fromError<T extends typeof LiveSyncError>(this: T, error: any): InstanceType<T> {
+    static fromError<T extends typeof LiveSyncError>(this: T, error: unknown): InstanceType<T> {
         if (error instanceof this) {
             return error as InstanceType<T>;
         }
-        const instance = new this(`${this.name}: ${error?.message}`, { cause: error }) as InstanceType<T>;
-        if (error?.stack) {
+        const instance = new this(`${this.name}: ${getMessageFromError(error)}`, {
+            cause: error,
+            status: getStatusFromError(error),
+        }) as InstanceType<T>;
+        if (error instanceof Error) {
             instance.stack = error.stack;
         } else {
             instance.stack = new Error().stack;

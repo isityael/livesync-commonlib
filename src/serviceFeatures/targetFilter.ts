@@ -10,7 +10,7 @@ import { promiseWithResolvers } from "octagonal-wheels/promises";
 /**
  * This is a simple handler that accepts all files.
  */
-export function isAcceptedAlwaysFactory(host: NecessaryServices<any, any>, log: LogFunction) {
+export function isAcceptedAlwaysFactory(host: NecessaryServices<never, never>, log: LogFunction) {
     return (file: string | UXFileInfoStub) => {
         log("File is target finally: " + getStoragePathFromUXFileInfo(file), LOG_LEVEL_DEBUG);
         return Promise.resolve(true);
@@ -73,19 +73,19 @@ export function isAcceptedInFilenameDuplicationFactory(
  * This possibly should be separated.
  */
 export function isAcceptedByLocalDBFactory(
-    host: NecessaryServices<"database" | "databaseEvents", any>,
+    host: NecessaryServices<"database" | "databaseEvents", never>,
     log: LogFunction
 ) {
     const database = host.services.database;
     const databaseEvents = host.services.databaseEvents;
 
-    let isReady = promiseWithResolvers();
+    let isReady = promiseWithResolvers<void>();
     databaseEvents.onDatabaseHasReady.addHandler(() => {
         isReady.resolve();
         return Promise.resolve(true);
     });
     databaseEvents.onUnloadDatabase.addHandler(() => {
-        isReady = promiseWithResolvers();
+        isReady = promiseWithResolvers<void>();
         return Promise.resolve(true);
     });
     return async (file: string | UXFileInfoStub): Promise<boolean> => {

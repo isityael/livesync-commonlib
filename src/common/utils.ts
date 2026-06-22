@@ -1,7 +1,7 @@
 import { LRUCache } from "octagonal-wheels/memory/LRUCache";
-import { isPlainText } from "../string_and_binary/path.ts";
+import { isPlainText } from "@lib/string_and_binary/path.ts";
 import { Semaphore } from "octagonal-wheels/concurrency/semaphore";
-import { arrayBufferToBase64Single, decodeBinary, writeString } from "../string_and_binary/convert.ts";
+import { arrayBufferToBase64Single, decodeBinary, writeString } from "@lib/string_and_binary/convert.ts";
 import {
     type AnyEntry,
     type DatabaseEntry,
@@ -24,7 +24,7 @@ import {
     type CouchDBConnection,
     type EncryptionSettings,
 } from "./types.ts";
-import { isErrorOfMissingDoc } from "../pouchdb/utils_couchdb.ts";
+import { isErrorOfMissingDoc } from "@lib/pouchdb/utils_couchdb.ts";
 import { replaceAll, replaceAllPairs } from "octagonal-wheels/string";
 export { replaceAll, replaceAllPairs };
 import { concatUInt8Array } from "octagonal-wheels/binary";
@@ -50,10 +50,12 @@ import { BASE_IS_NEW, EVEN, TARGET_IS_NEW } from "./models/shared.const.symbols.
 export type { SimpleStore };
 
 export { sizeToHumanReadable } from "octagonal-wheels/number";
+import { compatGlobal } from "./coreEnvFunctions";
+import { ensureError } from "./utils.object.ts";
 
 export function resolveWithIgnoreKnownError<T>(p: Promise<T>, def: T): Promise<T> {
     return new Promise((res, rej) => {
-        p.then(res).catch((ex) => (isErrorOfMissingDoc(ex) ? res(def) : rej(ex)));
+        p.then(res).catch((ex) => (isErrorOfMissingDoc(ex) ? res(def) : rej(ensureError(ex))));
     });
 }
 
@@ -126,7 +128,7 @@ export function readContent(doc: LoadedEntry) {
     }
 }
 
-const isIndexDBCmpExist = typeof globalThis?.indexedDB?.cmp !== "undefined";
+const isIndexDBCmpExist = typeof compatGlobal?.indexedDB?.cmp !== "undefined";
 
 export async function isDocContentSame(
     docA: string | string[] | Blob | ArrayBuffer,
@@ -136,7 +138,7 @@ export async function isDocContentSame(
     const blob2 = createBlob(docB);
     if (blob1.size != blob2.size) return false;
     if (isIndexDBCmpExist) {
-        return globalThis.indexedDB.cmp(await blob1.arrayBuffer(), await blob2.arrayBuffer()) === 0;
+        return compatGlobal.indexedDB.cmp(await blob1.arrayBuffer(), await blob2.arrayBuffer()) === 0;
     }
     const checkQuantum = 10000;
     const length = blob1.size;
@@ -184,7 +186,7 @@ export function memorizeFuncWithLRUCache<T, U>(func: (key: T) => U) {
     };
 }
 
-export function memorizeFuncWithLRUCacheMulti<T extends Array<any>, U>(func: (...keys: T) => U) {
+export function memorizeFuncWithLRUCacheMulti<T extends unknown[], U>(func: (...keys: T) => U) {
     const cache = new LRUCache<string, U>(100, 100000, true);
     return (keys: T) => {
         const theKey = keys
@@ -348,9 +350,9 @@ export function unescapeNewLineFromString(str: string) {
     return p;
 }
 
-export function escapeMarkdownValue(value: any) {
+export function escapeMarkdownValue<T>(value: T): T {
     if (typeof value === "string") {
-        return replaceAllPairs(value, ["|", "\\|"], ["`", "\\`"]);
+        return replaceAllPairs(value, ["|", "\\|"], ["`", "\\`"]) as unknown as T;
     } else {
         return value;
     }
@@ -380,11 +382,11 @@ export function timeDeltaToHumanReadable(delta: number) {
 export async function wrapException<T>(func: () => Promise<Awaited<T>>): Promise<Awaited<T> | Error> {
     try {
         return await func();
-    } catch (ex: any) {
+    } catch (ex) {
         if (ex instanceof Error) {
             return ex;
         }
-        return new Error(ex);
+        return new Error(String(ex));
     }
 }
 
@@ -412,214 +414,30 @@ export function toRanges(sorted: number[]) {
     return ranges.join(",");
 }
 
-const previousValues = new Map<string, any>();
-export function isDirty(key: string, value: any) {
+const previousValues = new Map<string, unknown>();
+export function isDirty(key: string, value: unknown) {
     const prev = previousValues.get(key);
     if (prev === value) return false;
     previousValues.set(key, value);
     return true;
 }
 
-export function isSensibleMargeApplicable(path: string) {
-    if (path.endsWith(".md")) return true;
-    return false;
-}
-export function isObjectMargeApplicable(path: string) {
-    if (path.endsWith(".canvas")) return true;
-    if (path.endsWith(".json")) return true;
-    return false;
-}
-
-export function tryParseJSON(str: string, fallbackValue?: any) {
+export function tryParseJSON<T extends object>(str: string, fallbackValue?: T): T | undefined {
     try {
-        return JSON.parse(str);
+        return JSON.parse(str) as T;
     } catch {
         return fallbackValue;
     }
 }
 
-const MARK_OPERATOR = `\u{0001}`;
-const MARK_DELETED = `${MARK_OPERATOR}__DELETED`;
-const MARK_ISARRAY = `${MARK_OPERATOR}__ARRAY`;
-const MARK_SWAPPED = `${MARK_OPERATOR}__SWAP`;
-
-function unorderedArrayToObject(obj: Array<any>) {
-    return obj.map((e) => ({ [e.id as string]: e })).reduce((p, c) => ({ ...p, ...c }), {});
-}
-function objectToUnorderedArray(obj: object) {
-    const entries = Object.entries(obj);
-    if (entries.some((e) => e[0] != e[1]?.id)) throw new Error("Item looks like not unordered array");
-    return entries.map((e) => e[1]);
-}
-function generatePatchUnorderedArray(from: Array<any>, to: Array<any>) {
-    if (from.every((e) => typeof e == "object" && "id" in e) && to.every((e) => typeof e == "object" && "id" in e)) {
-        const fObj = unorderedArrayToObject(from);
-        const tObj = unorderedArrayToObject(to);
-        const diff = generatePatchObj(fObj, tObj);
-        if (Object.keys(diff).length > 0) {
-            return { [MARK_ISARRAY]: diff };
-        } else {
-            return {};
-        }
-    }
-    return { [MARK_SWAPPED]: to };
-}
-
-export function generatePatchObj(
-    from: Record<string | number | symbol, any>,
-    to: Record<string | number | symbol, any>
-) {
-    const entries = Object.entries(from);
-    const tempMap = new Map<string | number | symbol, any>(entries);
-    const ret = {} as Record<string | number | symbol, any>;
-    const newEntries = Object.entries(to);
-    for (const [key, value] of newEntries) {
-        if (!tempMap.has(key)) {
-            //New
-            ret[key] = value;
-            tempMap.delete(key);
-        } else {
-            //Exists
-            const v = tempMap.get(key);
-            if (typeof v !== typeof value || Array.isArray(v) !== Array.isArray(value)) {
-                //if type is not match, replace completely.
-                ret[key] = { [MARK_SWAPPED]: value };
-            } else {
-                if (v === null && value === null) {
-                    // NO OP.
-                } else if (v === null && value !== null) {
-                    ret[key] = { [MARK_SWAPPED]: value };
-                } else if (v !== null && value === null) {
-                    ret[key] = { [MARK_SWAPPED]: value };
-                } else if (
-                    typeof v == "object" &&
-                    typeof value == "object" &&
-                    !Array.isArray(v) &&
-                    !Array.isArray(value)
-                ) {
-                    const wk = generatePatchObj(v, value);
-                    if (Object.keys(wk).length > 0) ret[key] = wk;
-                } else if (
-                    typeof v == "object" &&
-                    typeof value == "object" &&
-                    Array.isArray(v) &&
-                    Array.isArray(value)
-                ) {
-                    const wk = generatePatchUnorderedArray(v, value);
-                    if (Object.keys(wk).length > 0) ret[key] = wk;
-                } else if (typeof v != "object" && typeof value != "object") {
-                    if (JSON.stringify(tempMap.get(key)) !== JSON.stringify(value)) {
-                        ret[key] = value;
-                    }
-                } else {
-                    if (JSON.stringify(tempMap.get(key)) !== JSON.stringify(value)) {
-                        ret[key] = { [MARK_SWAPPED]: value };
-                    }
-                }
-            }
-            tempMap.delete(key);
-        }
-    }
-    //Not used item, means deleted one
-    for (const [key] of tempMap) {
-        ret[key] = MARK_DELETED;
-    }
-    return ret;
-}
-
-export function applyPatch(from: Record<string | number | symbol, any>, patch: Record<string | number | symbol, any>) {
-    const ret = from;
-    const patches = Object.entries(patch);
-    for (const [key, value] of patches) {
-        if (value == MARK_DELETED) {
-            delete ret[key];
-            continue;
-        }
-        if (value === null) {
-            ret[key] = null;
-            continue;
-        }
-        if (typeof value == "object") {
-            if (MARK_SWAPPED in value) {
-                ret[key] = value[MARK_SWAPPED];
-                continue;
-            }
-            if (MARK_ISARRAY in value) {
-                if (!(key in ret)) ret[key] = [];
-                if (!Array.isArray(ret[key])) {
-                    throw new Error("Patch target type is mismatched (array to something)");
-                }
-                const orgArrayObject = unorderedArrayToObject(ret[key]);
-                const appliedObject = applyPatch(orgArrayObject, value[MARK_ISARRAY]);
-                const appliedArray = objectToUnorderedArray(appliedObject);
-                ret[key] = [...appliedArray];
-            } else {
-                if (!(key in ret)) {
-                    ret[key] = value;
-                    continue;
-                }
-                ret[key] = applyPatch(ret[key], value);
-            }
-        } else {
-            ret[key] = value;
-        }
-    }
-    return ret;
-}
-
-export function mergeObject(
-    objA: Record<string | number | symbol, any> | [any],
-    objB: Record<string | number | symbol, any> | [any]
-) {
-    const newEntries = Object.entries(objB);
-    const ret: any = { ...objA };
-    if (typeof objA !== typeof objB || Array.isArray(objA) !== Array.isArray(objB)) {
-        return objB;
-    }
-
-    for (const [key, v] of newEntries) {
-        if (key in ret) {
-            const value = ret[key];
-            if (typeof v !== typeof value || Array.isArray(v) !== Array.isArray(value)) {
-                //if type is not match, replace completely.
-                ret[key] = v;
-            } else {
-                if (typeof v == "object" && typeof value == "object" && !Array.isArray(v) && !Array.isArray(value)) {
-                    ret[key] = mergeObject(v, value);
-                } else if (
-                    typeof v == "object" &&
-                    typeof value == "object" &&
-                    Array.isArray(v) &&
-                    Array.isArray(value)
-                ) {
-                    ret[key] = [...new Set([...v, ...value])];
-                } else {
-                    ret[key] = v;
-                }
-            }
-        } else {
-            ret[key] = v;
-        }
-    }
-    const retSorted = Object.fromEntries(Object.entries(ret).sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)));
-    if (Array.isArray(objA) && Array.isArray(objB)) {
-        return Object.values(retSorted);
-    }
-    return retSorted;
-}
-
-export function flattenObject(obj: Record<string | number | symbol, any>, path: string[] = []): [string, any][] {
-    if (typeof obj != "object") return [[path.join("."), obj]];
-    if (obj === null) return [[path.join("."), null]];
-    if (Array.isArray(obj)) return [[path.join("."), JSON.stringify(obj)]];
-    const e = Object.entries(obj);
-    const ret = [];
-    for (const [key, value] of e) {
-        const p = flattenObject(value, [...path, key]);
-        ret.push(...p);
-    }
-    return ret;
-}
+export {
+    mergeObject,
+    applyPatch,
+    generatePatchObj,
+    flattenObject,
+    isObjectMargeApplicable,
+    isSensibleMargeApplicable,
+} from "./utils.patch.ts";
 
 export function parseHeaderValues(strHeader: string): Record<string, string> {
     const headers: Record<string, string> = {};
@@ -798,8 +616,9 @@ export function pickP2PSyncSettings(setting: Partial<ObsidianLiveSyncSettings> &
 export function wrapByDefault<T, U>(func: () => T, onError: (err: Error) => U): T | U {
     try {
         return func();
-    } catch (ex: any) {
-        return onError(ex);
+    } catch (ex) {
+        const error = ex instanceof Error ? ex : new Error(String(ex));
+        return onError(error);
     }
 }
 
@@ -820,4 +639,35 @@ export function compareMTime(
 export function displayRev(rev: string) {
     const [number, hash] = rev.split("-");
     return `${number}-${hash.substring(0, 6)}`;
+}
+
+/**
+ * Generate a random P2P Room ID in the format `123-456-789-abc`.
+ */
+export function generateP2PRoomId(): string {
+    const randomValues = new Uint16Array(4);
+    crypto.getRandomValues(randomValues);
+    const MAX_UINT16 = 65536;
+    const a = Math.floor((randomValues[0] / MAX_UINT16) * 1000);
+    const b = Math.floor((randomValues[1] / MAX_UINT16) * 1000);
+    const c = Math.floor((randomValues[2] / MAX_UINT16) * 1000);
+    const dRange = 36 * 36 * 36;
+    const d = Math.floor((randomValues[3] / MAX_UINT16) * dRange);
+    return `${a.toString().padStart(3, "0")}-${b.toString().padStart(3, "0")}-${c
+        .toString()
+        .padStart(3, "0")}-${d.toString(36).padStart(3, "0")}`;
+}
+
+/**
+ * Extract the stable suffix (last segment) from a Room ID.
+ */
+export function extractP2PRoomSuffix(roomId: string): string {
+    const trimmed = roomId.trim();
+    if (trimmed === "") return "";
+    const parts = trimmed
+        .split("-")
+        .map((e) => e.trim())
+        .filter((e) => e);
+    if (parts.length === 0) return "";
+    return parts[parts.length - 1] ?? "";
 }

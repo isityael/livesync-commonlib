@@ -13,9 +13,9 @@ import {
     type BucketSyncSetting,
     E2EEAlgorithms,
     type RemoteDBSettings,
-} from "../../common/types.ts";
-import { Logger } from "../../common/logger.ts";
-import type { ReplicationCallback, ReplicationStat } from "../LiveSyncAbstractReplicator.ts";
+} from "@lib/common/types.ts";
+import { Logger } from "@lib/common/logger.ts";
+import type { ReplicationCallback, ReplicationStat } from "@lib/replication/LiveSyncAbstractReplicator.ts";
 import {
     type SimpleStore,
     concatUInt8Array,
@@ -24,10 +24,10 @@ import {
     parseHeaderValues,
     setAllItems,
     unescapeNewLineFromString,
-} from "../../common/utils.ts";
+} from "@lib/common/utils.ts";
 import { shareRunningResult } from "octagonal-wheels/concurrency/lock";
-import { wrappedDeflate } from "../../pouchdb/compress.ts";
-import { wrappedInflate } from "../../pouchdb/compress.ts";
+import { wrappedDeflate } from "@lib/pouchdb/compress.ts";
+import { wrappedInflate } from "@lib/pouchdb/compress.ts";
 import { type CheckPointInfo, CheckPointInfoDefault } from "./JournalSyncTypes.ts";
 import type { LiveSyncJournalReplicatorEnv } from "./LiveSyncJournalReplicatorEnv.ts";
 import { Trench } from "octagonal-wheels/memory/memutil";
@@ -39,9 +39,9 @@ import {
     SyncParamsFetchError,
     SyncParamsNotFoundError,
     SyncParamsUpdateError,
-} from "../SyncParamsHandler.ts";
-import { eventHub } from "../../hub/hub.ts";
-import { REMOTE_CHUNK_FETCHED } from "../../pouchdb/LiveSyncLocalDB.ts";
+} from "@lib/replication/SyncParamsHandler.ts";
+import { eventHub } from "@lib/hub/hub.ts";
+import { REMOTE_CHUNK_FETCHED } from "@lib/pouchdb/LiveSyncLocalDB.ts";
 import { decryptBinary, encryptBinary } from "octagonal-wheels/encryption/encryption";
 import {
     encryptBinary as encryptBinaryHKDF,
@@ -191,7 +191,7 @@ export abstract class JournalSyncAbstract {
     _currentCheckPointInfo = { ...CheckPointInfoDefault };
     async getCheckpointInfo(): Promise<CheckPointInfo> {
         const checkPointKey = `bucketsync-checkpoint-${this.hash}` as DocumentID;
-        const old: any = (await this.store.get(checkPointKey)) || {};
+        const old: Record<string, unknown> = (await this.store.get(checkPointKey)) || {};
         const items = ["knownIDs", "sentIDs", "receivedFiles", "sentFiles"];
         for (const key of items) {
             if (!(key in old)) {
@@ -291,7 +291,7 @@ export abstract class JournalSyncAbstract {
 
     abstract resetBucket(): Promise<boolean>;
 
-    abstract uploadJson<T>(key: string, body: any): Promise<T | boolean>;
+    abstract uploadJson<T>(key: string, body: T): Promise<boolean>;
     abstract downloadJson<T>(key: string): Promise<T | false>;
 
     abstract uploadFile(key: string, blob: Blob, mime: string): Promise<boolean>;
@@ -417,8 +417,8 @@ export abstract class JournalSyncAbstract {
         // Thinning out the docs.
         const docChanges = docs
             .filter((e) => "ok" in e)
-            .map((e) => (e as any).ok)
-            .filter((doc: EntryDoc) => {
+            .map((e) => e.ok)
+            .filter((doc) => {
                 const key = this.getDocKey(doc);
                 if (this._currentCheckPointInfo.knownIDs.has(key)) {
                     knownKeyCount++;
@@ -429,7 +429,7 @@ export abstract class JournalSyncAbstract {
                     return false;
                 }
                 return true;
-            }) as (EntryDoc & PouchDB.Core.GetMeta)[];
+            });
         Logger(
             `Checked ${allChanges.results.length} changed entries, selected ${docChanges.length} docs (${knownKeyCount} keys already known)`,
             LOG_LEVEL_DEBUG
@@ -649,7 +649,7 @@ export abstract class JournalSyncAbstract {
             // Chunks always have the same content, hence revision comparisons are unnecessary
             try {
                 const e1 = (await this.db.allDocs({ include_docs: true, keys: [...chunks.map((e) => e._id)] })).rows;
-                const e2 = e1.map((e) => (e as any).id ?? undefined);
+                const e2 = e1.map((e) => (e as { id?: string }).id ?? undefined);
                 const existChunks = new Set(e2.filter((e) => e !== undefined));
                 const saveChunks = chunks
                     .filter((e) => !existChunks.has(e._id))
@@ -699,7 +699,18 @@ export abstract class JournalSyncAbstract {
                 LOG_LEVEL_VERBOSE
             );
             await this.db.bulkDocs<EntryDoc>(saveDocs, { new_edits: false });
-            await this.processReplication(saveDocs as PouchDB.Core.ExistingDocument<EntryDoc>[]);
+            // Only process if parsing is not suspended.
+            const writeDoc = !this.env.services.setting.currentSettings().suspendParseReplicationResult;
+            if (writeDoc) {
+                await this.processReplication(saveDocs satisfies PouchDB.Core.ExistingDocument<EntryDoc>[]);
+            } else {
+                if (saveDocs.length > 0) {
+                    Logger(
+                        `Skipping processing replication for ${saveDocs.length} docs as it is suspended.`,
+                        LOG_LEVEL_VERBOSE
+                    );
+                }
+            }
             await this.updateCheckPointInfo((info) => ({
                 ...info,
                 knownIDs: setAllItems(

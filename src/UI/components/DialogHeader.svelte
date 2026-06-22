@@ -1,14 +1,15 @@
 <script lang="ts">
     import { onMount, tick } from "svelte";
-    import { translateIfAvailable as translate } from "../../common/i18n.ts";
-    import { getDialogContext } from "../svelteDialog.ts";
+    import { translateIfAvailable as translate } from "@lib/common/i18n.ts";
+    import { getDialogContext } from "@lib/UI/svelteDialog.ts";
+    import { _activeDocument } from "@lib/common/coreEnvFunctions.ts";
 
     type Props = {
         title: string;
         subtitle?: string;
         children?: () => unknown;
     };
-    let { title = $bindable(), subtitle, children }: Props = $props();
+    let { title = $bindable(), subtitle }: Props = $props();
     const context = getDialogContext();
     const translatedTitle = $derived.by(() => translate(title));
     const translatedSubtitle = $derived.by(() => (subtitle ? translate(subtitle) : ""));
@@ -22,7 +23,7 @@
     onMount(async () => {
         context.setTitle(modalTitle);
         await tick();
-        document.querySelector(".modal")?.scrollTo(0, 0);
+        _activeDocument.querySelector(".modal")?.scrollTo(0, 0);
     });
 </script>
 

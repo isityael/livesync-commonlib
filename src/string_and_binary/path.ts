@@ -1,5 +1,5 @@
 import { minimatch, type MinimatchOptions } from "minimatch";
-import { getWebCrypto } from "../mods.ts";
+import { getWebCrypto } from "@lib/mods.ts";
 import {
     type AnyEntry,
     type DocumentID,
@@ -14,8 +14,8 @@ import {
     FLAGMD_REDFLAG2_HR,
     FLAGMD_REDFLAG3_HR,
     PREFIXMD_LOGFILE_UC,
-} from "../common/types.ts";
-import { memorizeFuncWithLRUCache } from "../common/utils.ts";
+} from "@lib/common/types.ts";
+import { memorizeFuncWithLRUCache } from "@lib/common/utils.ts";
 import { uint8ArrayToHexString, writeString } from "./convert.ts";
 import { unique } from "octagonal-wheels/collection.js";
 // --- path utilities
@@ -104,11 +104,11 @@ export async function path2id_base(
     let filename = `${filenameSrc}`;
     const newPrefix = obfuscatePassphrase ? PREFIX_OBFUSCATED : "";
     if (caseInsensitive) {
-        filename = filename.toLowerCase() as FilePathWithPrefix;
+        filename = filename.toLowerCase();
     }
 
     let x = filename;
-    if (x.startsWith("_")) x = ("/" + x) as FilePathWithPrefix;
+    if (x.startsWith("_")) x = "/" + x;
 
     if (!obfuscatePassphrase) {
         return (newPrefix + x) as DocumentID;

@@ -1,13 +1,13 @@
 import type { SimpleStore } from "@lib/common/utils";
 import type { IKeyValueDBService, IVaultService } from "./IService";
 import { ServiceBase, type ServiceContext } from "./ServiceBase";
-import type { KeyValueDatabase } from "../../interfaces/KeyValueDatabase";
+import type { KeyValueDatabase } from "@lib/interfaces/KeyValueDatabase";
 import { OpenKeyValueDatabase } from "@/common/KeyValueDB";
 import { delay, yieldMicrotask } from "octagonal-wheels/promises";
-import { LOG_LEVEL_NOTICE, LOG_LEVEL_VERBOSE } from "../../common/logger";
-import { createInstanceLogFunction } from "../lib/logUtils";
-import type { InjectableDatabaseEventService } from "../implements/injectable/InjectableDatabaseEventService";
-import type { AppLifecycleServiceBase } from "../implements/injectable/InjectableAppLifecycleService";
+import { LOG_LEVEL_NOTICE, LOG_LEVEL_VERBOSE } from "@lib/common/logger";
+import { createInstanceLogFunction } from "@lib/services/lib/logUtils";
+import type { InjectableDatabaseEventService } from "@lib/services/implements/injectable/InjectableDatabaseEventService";
+import type { AppLifecycleServiceBase } from "@lib/services/implements/injectable/InjectableAppLifecycleService";
 
 export interface KeyValueDBDependencies<T extends ServiceContext = ServiceContext> {
     databaseEvents: InjectableDatabaseEventService<T>;
@@ -23,7 +23,7 @@ export abstract class KeyValueDBService<T extends ServiceContext = ServiceContex
     implements IKeyValueDBService
 {
     private _kvDB: KeyValueDatabase | undefined;
-    private _simpleStore: SimpleStore<any> | undefined;
+    private _simpleStore: SimpleStore<unknown> | undefined;
     get simpleStore() {
         if (!this._simpleStore) {
             throw new Error("SimpleStore is not initialized yet");
@@ -108,7 +108,7 @@ export abstract class KeyValueDBService<T extends ServiceContext = ServiceContex
         if (!(await this.openKeyValueDB())) {
             return false;
         }
-        this._simpleStore = this.openSimpleStore<any>("os");
+        this._simpleStore = this.openSimpleStore<unknown>("os");
         return Promise.resolve(true);
     }
 
@@ -136,23 +136,19 @@ export abstract class KeyValueDBService<T extends ServiceContext = ServiceContex
             get: async (key: string): Promise<T> => {
                 return await getDB().get(`${prefix}${key}`);
             },
-            set: async (key: string, value: any): Promise<void> => {
+            set: async (key: string, value: unknown): Promise<void> => {
                 await getDB().set(`${prefix}${key}`, value);
             },
             delete: async (key: string): Promise<void> => {
                 await getDB().del(`${prefix}${key}`);
             },
-            keys: async (
-                from: string | undefined,
-                to: string | undefined,
-                count?: number | undefined
-            ): Promise<string[]> => {
+            keys: async (from: string | undefined, to: string | undefined, count?: number): Promise<string[]> => {
                 const ret = await getDB().keys(
                     IDBKeyRange.bound(`${prefix}${from || ""}`, `${prefix}${to || ""}`),
                     count
                 );
                 return ret
-                    .map((e) => e.toString())
+                    .map((e) => (typeof e === "string" ? e : JSON.stringify(e)).toString())
                     .filter((e) => e.startsWith(prefix))
                     .map((e) => e.substring(prefix.length));
             },

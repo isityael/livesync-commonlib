@@ -1,4 +1,4 @@
-import { Logger, LOG_LEVEL_NOTICE, LOG_LEVEL_VERBOSE } from "../common/logger";
+import { Logger, LOG_LEVEL_NOTICE, LOG_LEVEL_VERBOSE } from "@lib/common/logger";
 import {
     type EntryDoc,
     type AnyEntry,
@@ -9,11 +9,11 @@ import {
     type E2EEAlgorithm,
     E2EEAlgorithms,
     isMetaEntry,
-} from "../common/types";
-import { isEncryptedChunkEntry, isSyncInfoEntry, isObfuscatedEntry } from "../common/utils";
+} from "@lib/common/types";
+import { isEncryptedChunkEntry, isSyncInfoEntry, isObfuscatedEntry } from "@lib/common/utils";
 import { isPathProbablyObfuscated, obfuscatePath } from "octagonal-wheels/encryption/encryption";
 // import { encryptHKDF, decryptHKDF } from "../encryption/encryptHKDF.ts";
-import { getPath } from "../string_and_binary/path.ts";
+import { getPath } from "@lib/string_and_binary/path.ts";
 import { encryptWorker, decryptWorker, encryptHKDFWorker, decryptHKDFWorker } from "@lib/worker/bgWorker.ts";
 
 export const encrypt = encryptWorker;
@@ -80,7 +80,7 @@ type EncryptProps = {
     mtime: number;
     ctime: number;
     size: number;
-    children?: any[];
+    children?: string[];
 };
 async function encryptMetaWithHKDF<T extends AnyEntry>(
     doc: T,
@@ -248,7 +248,7 @@ async function outgoingDecryptHKDF(
             try {
                 const metadata = await decryptMetaWithHKDF(path, passphrase, pbkdf2salt);
                 for (const key of Object.keys(metadata)) {
-                    (loadDoc as any)[key] = metadata[key as keyof EncryptProps];
+                    (loadDoc as unknown as Record<string, unknown>)[key] = metadata[key as keyof EncryptProps];
                 }
             } catch (ex) {
                 Logger(`${DECRYPTION_HKDF_FAILED} on Path`, LOG_LEVEL_NOTICE);
@@ -262,7 +262,7 @@ async function outgoingDecryptHKDF(
                 Logger(`${MESSAGE_FALLBACK_DECRYPT_FAILED} on Path`, LOG_LEVEL_NOTICE);
                 throw new Error(MESSAGE_FALLBACK_DECRYPT_FAILED);
             }
-            loadDoc.path = decryptedPath as unknown as FilePathWithPrefix;
+            loadDoc.path = decryptedPath as FilePathWithPrefix;
         }
     }
     let readEden: EntryWithEden["eden"] = {};
@@ -309,7 +309,7 @@ async function outgoingDecryptHKDF(
         }
     }
     if (edenDecrypted) {
-        (loadDoc as any).eden = readEden;
+        (loadDoc as unknown as Record<string, unknown>).eden = readEden;
     } else {
         // If Eden is not decrypted, NO OP.
     }
@@ -322,13 +322,13 @@ async function incomingEncryptV1(
 ): Promise<EntryLeaf | AnyEntry> {
     const saveDoc = {
         ...doc,
-    } as EntryLeaf | AnyEntry;
+    } satisfies EntryLeaf | AnyEntry;
 
     if (isEncryptedChunkEntry(saveDoc) || isSyncInfoEntry(saveDoc)) {
         try {
             if (!("e_" in saveDoc)) {
                 saveDoc.data = await encrypt(saveDoc.data, passphrase, useDynamicIterationCount);
-                (saveDoc as any).e_ = true;
+                (saveDoc as unknown as Record<string, unknown>).e_ = true;
             }
         } catch (ex) {
             Logger("Encryption failed.", LOG_LEVEL_NOTICE);
@@ -384,10 +384,14 @@ async function outgoingDecryptV1(
         try {
             if (_isChunkOrSyncInfo) {
                 loadDoc.data = await decrypt(loadDoc.data, passphrase, useDynamicIterationCount);
-                delete (loadDoc as any).e_;
+                delete (loadDoc as unknown as Record<string, unknown>).e_;
             } else if ("e_" in loadDoc) {
-                (loadDoc as any).data = await decrypt((loadDoc as any).data, passphrase, useDynamicIterationCount);
-                delete (loadDoc as any).e_;
+                (loadDoc as unknown as Record<string, unknown>).data = await decrypt(
+                    (loadDoc as unknown as { data: string }).data,
+                    passphrase,
+                    useDynamicIterationCount
+                );
+                delete (loadDoc as unknown as Record<string, unknown>).e_;
             }
             if (_isObfuscatedEntry) {
                 const path = getPath(loadDoc);
@@ -427,8 +431,8 @@ async function outgoingDecryptV1(
                     if (migrationDecrypt) {
                         decrypted.set(loadDoc._id, true);
                     }
-                } catch (ex: any) {
-                    if (migrationDecrypt && ex.name == "SyntaxError") {
+                } catch (ex) {
+                    if (migrationDecrypt && ex instanceof SyntaxError) {
                         return loadDoc; // This logic will be removed in a while.
                     }
                     Logger("Decryption failed.", LOG_LEVEL_NOTICE);
@@ -453,6 +457,39 @@ export let preprocessIncoming: (doc: EntryDoc) => Promise<EntryDoc> = async (doc
     return await Promise.resolve(doc);
 };
 
+export function getConfiguredFunctionsForEncryption(
+    passphrase: string,
+    useDynamicIterationCount: boolean,
+    migrationDecrypt: boolean,
+    getPBKDF2Salt: () => Promise<Uint8Array<ArrayBuffer>>,
+    algorithm: E2EEAlgorithm
+): {
+    incoming: (doc: AnyEntry | EntryLeaf) => Promise<AnyEntry | EntryLeaf>;
+    outgoing: (doc: EntryDoc) => Promise<AnyEntry | EntryLeaf>;
+} {
+    const decryptedCache = new Map();
+    const incoming = (doc: AnyEntry | EntryLeaf) =>
+        algorithm === E2EEAlgorithms.V2
+            ? incomingEncryptHKDF(doc, passphrase, useDynamicIterationCount, getPBKDF2Salt)
+            : incomingEncryptV1(doc, passphrase, useDynamicIterationCount);
+    // If unless specified algorithm is ForceV1, then use HKDF decryption for forward compatibility.
+    const outgoing = (doc: EntryDoc) =>
+        algorithm !== E2EEAlgorithms.ForceV1
+            ? outgoingDecryptHKDF(
+                  doc,
+                  migrationDecrypt,
+                  decryptedCache,
+                  passphrase,
+                  useDynamicIterationCount,
+                  getPBKDF2Salt
+              )
+            : outgoingDecryptV1(doc, migrationDecrypt, decryptedCache, passphrase, useDynamicIterationCount);
+    return {
+        incoming,
+        outgoing,
+    };
+}
+
 export const enableEncryption = (
     db: PouchDB.Database<EntryDoc>,
     passphrase: string,
@@ -461,19 +498,13 @@ export const enableEncryption = (
     getPBKDF2Salt: () => Promise<Uint8Array<ArrayBuffer>>,
     algorithm: E2EEAlgorithm
 ) => {
-    const decrypted = new Map();
-
-    const incoming = (doc: AnyEntry | EntryLeaf) =>
-        algorithm === E2EEAlgorithms.V2
-            ? incomingEncryptHKDF(doc, passphrase, useDynamicIterationCount, getPBKDF2Salt)
-            : incomingEncryptV1(doc, passphrase, useDynamicIterationCount);
-    // If unless specified algorithm is ForceV1, then use HKDF decryption for forward compatibility.
-    const outgoing = (doc: EntryDoc) =>
-        algorithm !== E2EEAlgorithms.ForceV1
-            ? outgoingDecryptHKDF(doc, migrationDecrypt, decrypted, passphrase, useDynamicIterationCount, getPBKDF2Salt)
-            : outgoingDecryptV1(doc, migrationDecrypt, decrypted, passphrase, useDynamicIterationCount);
-    preprocessOutgoing = incoming;
-    preprocessIncoming = outgoing;
+    const { incoming, outgoing } = getConfiguredFunctionsForEncryption(
+        passphrase,
+        useDynamicIterationCount,
+        migrationDecrypt,
+        getPBKDF2Salt,
+        algorithm
+    );
     //@ts-ignore
     db.transform({
         incoming,

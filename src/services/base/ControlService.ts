@@ -4,16 +4,16 @@
 // In the other word, it is orchestrating services.
 
 import { LOG_LEVEL_URGENT } from "octagonal-wheels/common/logger";
-import { createInstanceLogFunction } from "../lib/logUtils";
+import { createInstanceLogFunction } from "@lib/services/lib/logUtils";
 import type { APIService } from "./APIService";
 import type { DatabaseService } from "./DatabaseService";
 import type { IControlService, IFileProcessingService, IReplicatorService, ISettingService } from "./IService";
 import { ServiceBase, type ServiceContext } from "./ServiceBase";
-import { eventHub } from "../../hub/hub";
-import { EVENT_PLATFORM_UNLOADED, EVENT_PLUGIN_UNLOADED } from "../../events/coreEvents";
+import { eventHub } from "@lib/hub/hub";
+import { EVENT_PLATFORM_UNLOADED, EVENT_PLUGIN_UNLOADED } from "@lib/events/coreEvents";
 import { cancelAllPeriodicTask, cancelAllTasks } from "octagonal-wheels/concurrency/task";
 import { stopAllRunningProcessors } from "octagonal-wheels/concurrency/processor";
-import { $msg } from "../../common/i18n";
+import { $msg } from "@lib/common/i18n";
 import { promiseWithResolvers, type PromiseWithResolvers } from "octagonal-wheels/promises";
 import type { AppLifecycleService } from "./AppLifecycleService";
 
@@ -85,7 +85,7 @@ export class ControlService<T extends ServiceContext = ServiceContext>
     private async _onLiveSyncUnload(): Promise<void> {
         eventHub.emitEvent(EVENT_PLUGIN_UNLOADED);
         await this.services.appLifecycleService.onBeforeUnload();
-        await this.services.appLifecycleService.onAppUnload();
+        await Promise.resolve(this.services.appLifecycleService.onAppUnload());
         cancelAllPeriodicTask();
         cancelAllTasks();
         stopAllRunningProcessors();

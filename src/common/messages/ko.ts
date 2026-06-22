@@ -1,4 +1,4 @@
-import ko from "../messagesJson/ko.json" with { type: "json" };
+import ko from "@lib/common/messagesJson/ko.json" with { type: "json" };
 export const PartialMessages = {
     ko,
 } as const;
