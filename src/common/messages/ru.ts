@@ -1,4 +1,4 @@
-import ru from "../messagesJson/ru.json" with { type: "json" };
+import ru from "@lib/common/messagesJson/ru.json" with { type: "json" };
 export const PartialMessages = {
     ru,
 } as const;

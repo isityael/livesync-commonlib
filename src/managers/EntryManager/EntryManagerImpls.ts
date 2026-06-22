@@ -1,3 +1,4 @@
+import type PouchDB from "pouchdb-core";
 import { Logger, LOG_LEVEL_VERBOSE, LOG_LEVEL_NOTICE } from "octagonal-wheels/common/logger";
 import {
     type SavingEntry,
@@ -22,9 +23,9 @@ import {
     type NoteEntry,
 } from "@lib/common/types";
 import type { ContentSplitter } from "@lib/ContentSplitter/ContentSplitters";
-import type { HashManager } from "../HashManager/HashManager";
-import type { LayeredChunkManager as ChunkManager } from "../LayeredChunkManager";
-import type { ChunkWriteOptions } from "../LayeredChunkManager/types";
+import type { HashManager } from "@lib/managers/HashManager/HashManager";
+import type { LayeredChunkManager as ChunkManager } from "@lib/managers/LayeredChunkManager";
+import type { ChunkWriteOptions } from "@lib/managers/LayeredChunkManager/types";
 import { serialized } from "octagonal-wheels/concurrency/lock";
 import { createTextBlob, getFileRegExp, isTextBlob } from "@lib/common/utils";
 import type { NecessaryServicesInterfaces } from "@lib/interfaces/ServiceModule";
@@ -153,10 +154,11 @@ export async function createChunks(
 }
 
 export async function putDBEntry(
-    host: NecessaryServicesInterfaces<"path" | "setting", any>,
+    host: NecessaryServicesInterfaces<"path" | "setting", never>,
     managers: NecessaryManagers<"localDatabase" | "chunkManager" | "hashManager" | "splitter">,
     note: SavingEntry,
-    onlyChunks?: boolean
+    onlyChunks?: boolean,
+    conflictBaseRev?: string
 ) {
     const { localDatabase, chunkManager, splitter } = managers;
 
@@ -207,14 +209,18 @@ export async function putDBEntry(
 
         return (
             (await serialized("file:" + filename, async () => {
-                try {
-                    const old = await localDatabase.get(newDoc._id);
-                    newDoc._rev = old._rev;
-                } catch (ex: any) {
-                    if (isErrorOfMissingDoc(ex)) {
-                        // NO OP/
-                    } else {
-                        throw ex;
+                if (conflictBaseRev) {
+                    newDoc._rev = conflictBaseRev;
+                } else {
+                    try {
+                        const old = await localDatabase.get(newDoc._id);
+                        newDoc._rev = old._rev;
+                    } catch (ex) {
+                        if (isErrorOfMissingDoc(ex)) {
+                            // NO OP/
+                        } else {
+                            throw ex;
+                        }
                     }
                 }
                 const r = await localDatabase.put<PlainEntry | NewEntry>(newDoc, { force: true });
@@ -233,7 +239,7 @@ export async function putDBEntry(
     Logger(`Document saved: ${dispFilename} (${result.id.substring(0, 8)}-${result.rev})`, LOG_LEVEL_VERBOSE);
     return result;
 }
-export function isTargetFile(host: NecessaryServicesInterfaces<"setting", any>, filenameSrc: string) {
+export function isTargetFile(host: NecessaryServicesInterfaces<"setting", never>, filenameSrc: string) {
     const settings = host.services.setting.currentSettings();
     const file = filenameSrc.startsWith(ICHeader) ? filenameSrc.substring(ICHeader.length) : filenameSrc;
     if (file.startsWith(ICXHeader)) return true;
@@ -271,7 +277,7 @@ export async function prepareChunk(
 }
 
 export async function getDBEntryMetaByPath(
-    host: NecessaryServicesInterfaces<"path" | "setting", any>,
+    host: NecessaryServicesInterfaces<"path" | "setting", never>,
     { localDatabase }: NecessaryManagers<"localDatabase">,
     path: FilePathWithPrefix | FilePath,
     opt?: PouchDB.Core.GetOptions,
@@ -288,7 +294,8 @@ export async function getDBEntryMetaByPath(
         } else {
             obj = await localDatabase.get(id);
         }
-        const deleted = (obj as any)?.deleted ?? obj._deleted ?? undefined;
+        const deleted: boolean | undefined =
+            (obj as unknown as { deleted?: boolean })?.deleted ?? obj._deleted ?? undefined;
         if (!includeDeleted && deleted) return false;
         if (obj.type && obj.type == "leaf") {
             //do nothing for leaf;
@@ -317,12 +324,14 @@ export async function getDBEntryMetaByPath(
                 children: children,
                 datatype: type,
                 deleted: deleted,
+                _revisions: obj?._revisions ?? undefined,
+                _revs_info: obj?._revs_info ?? undefined,
                 type: type,
                 eden: "eden" in obj ? obj.eden : {},
             };
             return doc;
         }
-    } catch (ex: any) {
+    } catch (ex) {
         if (isErrorOfMissingDoc(ex)) {
             return false;
         }
@@ -508,7 +517,7 @@ async function respondEntryFromMeta(
             Logger(doc);
         }
         return doc;
-    } catch (ex: any) {
+    } catch (ex) {
         if (isErrorOfMissingDoc(ex)) {
             Logger(
                 `Missing document content!, could not read ${dispFilename}(${meta._id.substring(0, 8)}) from database.`,
@@ -526,7 +535,7 @@ async function respondEntryFromMeta(
 }
 
 export async function getDBEntryFromMeta(
-    host: NecessaryServicesInterfaces<"path" | "setting", any>,
+    host: NecessaryServicesInterfaces<"path" | "setting", never>,
     { localDatabase, chunkManager }: NecessaryManagers<"localDatabase" | "chunkManager">,
     meta: LoadedEntry | MetaEntry,
     dump = false,
@@ -557,7 +566,7 @@ export async function getDBEntryFromMeta(
     return false;
 }
 export async function getDBEntryByPath(
-    host: NecessaryServicesInterfaces<"path" | "setting", any>,
+    host: NecessaryServicesInterfaces<"path" | "setting", never>,
     managers: NecessaryManagers<"localDatabase" | "chunkManager">,
     path: FilePathWithPrefix | FilePath,
     opt?: PouchDB.Core.GetOptions,
@@ -573,7 +582,7 @@ export async function getDBEntryByPath(
     }
 }
 export async function deleteDBEntryByPath(
-    host: NecessaryServicesInterfaces<"path" | "setting", any>,
+    host: NecessaryServicesInterfaces<"path" | "setting", never>,
     { localDatabase }: NecessaryManagers<"localDatabase">,
     path: FilePathWithPrefix | FilePath,
     opt?: PouchDB.Core.GetOptions
@@ -628,7 +637,7 @@ export async function deleteDBEntryByPath(
                 }
             })) ?? false
         );
-    } catch (ex: any) {
+    } catch (ex) {
         if (isErrorOfMissingDoc(ex)) {
             return false;
         }

@@ -10,10 +10,10 @@ import type {
     // diff_result_leaf,
     LoadedEntry,
     // SavingEntry,
-} from "../common/types";
-import { MISSING_OR_ERROR, NOT_CONFLICTED } from "../common/types";
+} from "@lib/common/types";
+import { MISSING_OR_ERROR, NOT_CONFLICTED } from "@lib/common/types";
 import type { EntryManager } from "./EntryManager/EntryManager";
-import type { IPathService } from "../services/base/IService";
+import type { IPathService } from "@lib/services/base/IService";
 
 // Set up PouchDB with memory adapter
 PouchDB.plugin(MemoryAdapter);
@@ -248,9 +248,11 @@ describe("ConflictManager", () => {
         it("should return false when only one revision is deleted", async () => {
             const path = "test-doc" as FilePathWithPrefix;
 
+            // Create base version with actual content
             const baseDoc = createTestDoc(path, "base data", 1000);
             const baseResult = await db.put(baseDoc);
 
+            // Create two conflicting versions (not deleted)
             const doc1 = { ...createTestDoc(path, "version1", 2000), _rev: baseResult.rev };
             const result1 = await db.put(doc1);
 
@@ -263,6 +265,7 @@ describe("ConflictManager", () => {
             const currentDoc = await db.get(path, { conflicts: true });
             const conflictedRev = currentDoc._conflicts?.[0] || "";
 
+            // Now delete only the conflicted revision by updating the entry manager mock
             mockEntryManager.getDBEntry = vi.fn(async (p: FilePathWithPrefix, opt?: any) => {
                 const doc = await db.get(p2i(p), opt);
                 if (opt && opt.rev === conflictedRev) {
@@ -426,9 +429,11 @@ describe("ConflictManager", () => {
         it("should return false when only one revision is deleted", async () => {
             const path = "test.json" as FilePathWithPrefix;
 
+            // Create base version
             const baseDoc = createTestDoc(path, JSON.stringify({ key: "base" }), 1000);
             const baseResult = await db.put(baseDoc);
 
+            // Create two conflicting versions
             const doc1 = { ...createTestDoc(path, JSON.stringify({ key: "v1" }), 2000), _rev: baseResult.rev };
             const result1 = await db.put(doc1);
             unused(result1);
@@ -441,6 +446,7 @@ describe("ConflictManager", () => {
             const currentDoc = await db.get(path, { conflicts: true });
             const conflictedRev = currentDoc._conflicts?.[0] || "";
 
+            // Now make the entry manager return a deleted version for the conflicted revision
             mockEntryManager.getDBEntry = vi.fn(async (p: FilePathWithPrefix, opt?: any) => {
                 const doc = await db.get(p2i(p), opt);
                 if (opt && opt.rev === conflictedRev) {

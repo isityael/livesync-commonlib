@@ -1,3 +1,4 @@
+import { type Diff, diff_match_patch, DIFF_DELETE, DIFF_INSERT, DIFF_EQUAL } from "diff-match-patch";
 import { readString, decodeBinary } from "octagonal-wheels/binary";
 import { Logger, LOG_LEVEL_VERBOSE, LOG_LEVEL_INFO } from "octagonal-wheels/common/logger";
 import {
@@ -8,7 +9,7 @@ import {
     MISSING_OR_ERROR,
     NOT_CONFLICTED,
     type DIFF_CHECK_RESULT_AUTO,
-} from "../common/types.ts";
+} from "@lib/common/types.ts";
 import {
     getDocData,
     tryParseJSON,
@@ -17,11 +18,10 @@ import {
     applyPatch,
     isSensibleMargeApplicable,
     isObjectMargeApplicable,
-} from "../common/utils.ts";
-import type { EntryManager } from "../managers/EntryManager/EntryManager.ts";
-import { isErrorOfMissingDoc } from "../pouchdb/utils_couchdb.ts";
-import type { IPathService } from "../services/base/IService.ts";
-import { type Diff, diffLinesAsTuples, DIFF_DELETE, DIFF_EQUAL, DIFF_INSERT } from "./lineDiff.ts";
+} from "@lib/common/utils.ts";
+import type { EntryManager } from "@lib/managers/EntryManager/EntryManager.ts";
+import { isErrorOfMissingDoc } from "@lib/pouchdb/utils_couchdb.ts";
+import type { IPathService } from "@lib/services/base/IService.ts";
 
 type AutoMergeOutcomeOK = {
     ok: DIFF_CHECK_RESULT_AUTO;
@@ -97,8 +97,13 @@ export class ConflictManager {
             return false;
         }
         // diff between base and each revision
-        const diffLeftSrc = diffLinesAsTuples(baseLeaf.data, leftLeaf.data);
-        const diffRightSrc = diffLinesAsTuples(baseLeaf.data, rightLeaf.data);
+        const dmp = new diff_match_patch();
+        const mapLeft = dmp.diff_linesToChars_(baseLeaf.data, leftLeaf.data);
+        const diffLeftSrc = dmp.diff_main(mapLeft.chars1, mapLeft.chars2, false);
+        dmp.diff_charsToLines_(diffLeftSrc, mapLeft.lineArray);
+        const mapRight = dmp.diff_linesToChars_(baseLeaf.data, rightLeaf.data);
+        const diffRightSrc = dmp.diff_main(mapRight.chars1, mapRight.chars2, false);
+        dmp.diff_charsToLines_(diffRightSrc, mapRight.lineArray);
         function splitDiffPiece(src: Diff[]): Diff[] {
             const ret = [] as Diff[];
             do {
@@ -275,9 +280,9 @@ export class ConflictManager {
                 Logger(`Either is deleted`, LOG_LEVEL_VERBOSE);
                 return false;
             }
-            const baseObj = { data: tryParseJSON(baseLeaf.data, {}) } as Record<string | number | symbol, any>;
-            const leftObj = { data: tryParseJSON(leftLeaf.data, {}) } as Record<string | number | symbol, any>;
-            const rightObj = { data: tryParseJSON(rightLeaf.data, {}) } as Record<string | number | symbol, any>;
+            const baseObj = { data: tryParseJSON(baseLeaf.data, {}) } as Record<string | number | symbol, unknown>;
+            const leftObj = { data: tryParseJSON(leftLeaf.data, {}) } as Record<string | number | symbol, unknown>;
+            const rightObj = { data: tryParseJSON(rightLeaf.data, {}) } as Record<string | number | symbol, unknown>;
 
             const diffLeft = generatePatchObj(baseObj, leftObj);
             const diffRight = generatePatchObj(baseObj, rightObj);
@@ -372,6 +377,17 @@ export class ConflictManager {
         if (!test._conflicts) return { ok: NOT_CONFLICTED };
         if (test._conflicts.length == 0) return { ok: NOT_CONFLICTED };
         const conflicts = test._conflicts.sort((a, b) => Number(a.split("-")[0]) - Number(b.split("-")[0]));
+        // Resolve identical conflict leaves without creating a new revision.
+        const leftLeaf = await this.getConflictedDoc(path, test._rev!);
+        const rightLeaf = await this.getConflictedDoc(path, conflicts[0]);
+        if (
+            leftLeaf !== false &&
+            rightLeaf !== false &&
+            leftLeaf.data == rightLeaf.data &&
+            leftLeaf.deleted == rightLeaf.deleted
+        ) {
+            return { leftRev: test._rev!, rightRev: conflicts[0], leftLeaf, rightLeaf };
+        }
         if ((isSensibleMargeApplicable(path) || isObjectMargeApplicable(path)) && enableMarkdownAutoMerge) {
             const autoMergeResult = await this.tryAutoMergeSensibly(path, test, conflicts);
             if (autoMergeResult !== false) {
@@ -379,8 +395,6 @@ export class ConflictManager {
             }
         }
         // should be one or more conflicts;
-        const leftLeaf = await this.getConflictedDoc(path, test._rev!);
-        const rightLeaf = await this.getConflictedDoc(path, conflicts[0]);
         return { leftRev: test._rev!, rightRev: conflicts[0], leftLeaf, rightLeaf };
     }
 }

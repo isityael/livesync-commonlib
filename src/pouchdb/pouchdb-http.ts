@@ -36,6 +36,48 @@ function encodeDocId(id: string): string {
         .join("/");
 }
 
+function appendPurgeSeqs(db: PouchDB.Database, docs: PurgeMultiParam[]) {
+    return (
+        db
+            .get("_local/purges")
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Patches to PouchDB's internal document structure, which is not typed.
+            .then(function (doc: any) {
+                for (const [docId, rev$$1] of docs) {
+                    const purgeSeq = doc.purgeSeq + 1;
+                    doc.purges.push({
+                        docId,
+                        rev: rev$$1,
+                        purgeSeq,
+                    });
+                    //@ts-ignore : missing type def
+                    if (doc.purges.length > db.purged_infos_limit) {
+                        //@ts-ignore : missing type def
+                        doc.purges.splice(0, doc.purges.length - db.purged_infos_limit);
+                    }
+                    doc.purgeSeq = purgeSeq;
+                }
+                return doc;
+            })
+            .catch(function (err) {
+                if (err.status !== 404) {
+                    throw err;
+                }
+                return {
+                    _id: "_local/purges",
+                    purges: docs.map(([docId, rev$$1], idx) => ({
+                        docId,
+                        rev: rev$$1,
+                        purgeSeq: idx,
+                    })),
+                    purgeSeq: docs.length,
+                };
+            })
+            .then(function (doc) {
+                return db.put(doc);
+            })
+    );
+}
+
 function encodeQueryValue(value: unknown): string {
     if (typeof value === "string") return value;
     return JSON.stringify(value);
@@ -309,6 +351,10 @@ export class PouchDB<T extends object = any> extends MinimalEventEmitter {
         );
         const ret = await mapAllTasksWithConcurrencyLimit(1, tasks);
         const retAll = ret.map((e) => unwrapTaskResult(e)) as [PurgeMultiParam, PurgeMultiResult | Error][];
+        await appendPurgeSeqs(
+            this as unknown as PouchDB.Database,
+            retAll.filter((e) => "ok" in e[1]).map((e) => e[0])
+        );
         return Object.fromEntries(retAll.map((e) => [e[0][0], e[1]]));
     }
 

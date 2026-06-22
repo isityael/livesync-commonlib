@@ -9,7 +9,7 @@ import {
     decryptWithEphemeralSalt,
     HKDF_SALTED_ENCRYPTED_PREFIX,
 } from "octagonal-wheels/encryption/hkdf";
-import { LOG_LEVEL_VERBOSE, Logger } from "../common/logger";
+import { LOG_LEVEL_VERBOSE, Logger } from "@lib/common/logger";
 /**
  * Encrypts a string using a passphrase, unless the string is already encrypted.
  *
@@ -36,7 +36,8 @@ async function tryDecryption(trials: (() => Promise<string>)[]): Promise<string>
         try {
             return await trial();
         } catch (error) {
-            Logger(`Decryption trial failed: ${error}`, LOG_LEVEL_VERBOSE);
+            Logger(`Decryption trial failed!`, LOG_LEVEL_VERBOSE);
+            Logger(error, LOG_LEVEL_VERBOSE);
         }
     }
     throw new Error("All decryption trials failed");
@@ -74,7 +75,8 @@ export async function tryDecryptString(encrypted: string, passphrase: string | f
     try {
         return await decryptString(encrypted, passphrase as string);
     } catch (error) {
-        Logger(`Decryption failed: ${error}`, LOG_LEVEL_VERBOSE);
+        Logger(`Decryption failed!`, LOG_LEVEL_VERBOSE);
+        Logger(error, LOG_LEVEL_VERBOSE);
         return false;
     }
 }

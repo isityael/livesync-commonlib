@@ -15,18 +15,18 @@ import {
     type SavingEntry,
     type diff_result_leaf,
     SuffixDatabaseName,
-} from "../common/types.ts";
-import { Logger } from "../common/logger.ts";
+} from "@lib/common/types.ts";
+import { Logger } from "@lib/common/logger.ts";
 import { isErrorOfMissingDoc } from "./utils_couchdb.ts";
 
-import { EVENT_CHUNK_FETCHED } from "../managers/ChunkFetcher.ts";
-import { eventHub } from "../hub/hub.ts";
+import { EVENT_CHUNK_FETCHED } from "@lib/managers/ChunkFetcher.ts";
+import { eventHub } from "@lib/hub/hub.ts";
 import { FallbackWeakRef } from "octagonal-wheels/common/polyfill";
-import { LiveSyncManagers } from "../managers/LiveSyncManagers.ts";
-import type { AutoMergeResult } from "../managers/ConflictManager.ts";
-import type { IServiceHub } from "../services/base/IService.ts";
-import type { APIService } from "../services/base/APIService.ts";
-import { createInstanceLogFunction, type LogFunction } from "../services/lib/logUtils.ts";
+import { LiveSyncManagers } from "@lib/managers/LiveSyncManagers.ts";
+import type { AutoMergeResult } from "@lib/managers/ConflictManager.ts";
+import type { IServiceHub } from "@lib/services/base/IService.ts";
+import type { APIService } from "@lib/services/base/APIService.ts";
+import { createInstanceLogFunction, type LogFunction } from "@lib/services/lib/logUtils.ts";
 
 export const REMOTE_CHUNK_FETCHED = "remote-chunk-fetched";
 export type REMOTE_CHUNK_FETCHED = typeof REMOTE_CHUNK_FETCHED;
@@ -518,8 +518,8 @@ export class LiveSyncLocalDB {
     async deleteDBEntry(path: FilePathWithPrefix | FilePath, opt?: PouchDB.Core.GetOptions): Promise<boolean> {
         return await this.managers.entryManager.deleteDBEntry(path, opt);
     }
-    async putDBEntry(note: SavingEntry, onlyChunks?: boolean) {
-        return await this.managers.entryManager.putDBEntry(note, onlyChunks);
+    async putDBEntry(note: SavingEntry, onlyChunks?: boolean, conflictBaseRev?: string) {
+        return await this.managers.entryManager.putDBEntry(note, onlyChunks, conflictBaseRev);
     }
 
     async getConflictedDoc(path: FilePathWithPrefix, rev: string): Promise<false | diff_result_leaf> {

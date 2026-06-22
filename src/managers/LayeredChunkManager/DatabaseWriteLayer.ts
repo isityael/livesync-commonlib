@@ -1,5 +1,5 @@
-import { LiveSyncError } from "../../common/LSError";
-import type { EntryLeaf, DocumentID } from "../../common/types";
+import { LiveSyncError } from "@lib/common/LSError";
+import type { EntryLeaf, DocumentID, EntryDoc } from "@lib/common/types";
 import type { IWriteLayer } from "./ChunkLayerInterfaces";
 import type { ChunkWriteOptions, WriteResult } from "./types.ts";
 
@@ -8,7 +8,7 @@ import type { ChunkWriteOptions, WriteResult } from "./types.ts";
  */
 
 export class DatabaseWriteLayer implements IWriteLayer {
-    constructor(private database: PouchDB.Database<any>) {}
+    constructor(private database: PouchDB.Database<EntryDoc>) {}
 
     async write(
         chunks: EntryLeaf[],
@@ -59,7 +59,7 @@ export class DatabaseWriteLayer implements IWriteLayer {
             if (error instanceof LiveSyncError) {
                 throw error;
             }
-            throw new LiveSyncError(`Database write layer error: ${error}`, { status: 500, cause: error as Error });
+            throw new LiveSyncError(`Database write layer error!`, { status: 500, cause: error as Error });
         }
     }
 }

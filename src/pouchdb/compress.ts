@@ -3,8 +3,8 @@ import {
     tryConvertBase64ToArrayBuffer,
     arrayBufferToBase64Single,
     base64ToArrayBuffer,
-} from "../string_and_binary/convert";
-import type { EntryDoc } from "../common/types";
+} from "@lib/string_and_binary/convert";
+import type { EntryDoc } from "@lib/common/types";
 
 export async function _compressText(text: string) {
     const converted = tryConvertBase64ToArrayBuffer(text);
@@ -71,7 +71,7 @@ export async function decompressDoc(doc: EntryDoc) {
     return doc;
 }
 export function wrapFflateFunc<T, U>(
-    func: (data: T, opts: U, cb: fflate.FlateCallback) => any
+    func: (data: T, opts: U, cb: fflate.FlateCallback) => unknown
 ): (data: T, opts: U) => Promise<Uint8Array<ArrayBuffer>> {
     return (data: T, opts: U) => {
         return new Promise<Uint8Array<ArrayBuffer>>((res, rej) => {

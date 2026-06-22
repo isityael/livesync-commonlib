@@ -23,13 +23,13 @@ import type {
     NewEntry,
 } from "@lib/common/types";
 import { DEFAULT_SETTINGS, REMOTE_COUCHDB, IDPrefixes, ChunkAlgorithms } from "@lib/common/types";
-import { LayeredChunkManager } from "../LayeredChunkManager";
-import { HashManager } from "../HashManager/HashManager";
+import { LayeredChunkManager } from "@lib/managers/LayeredChunkManager";
+import { HashManager } from "@lib/managers/HashManager/HashManager";
 import type { IPathService, ISettingService } from "@lib/services/base/IService";
 import { ContentSplitter } from "@lib/ContentSplitter/ContentSplitters";
 import { createTextBlob, isDocContentSame } from "@lib/common/utils";
 import type { NecessaryServicesInterfaces } from "@lib/interfaces/ServiceModule";
-import type { WriteResult } from "../LayeredChunkManager/types";
+import type { WriteResult } from "@lib/managers/LayeredChunkManager/types";
 import { ICHeader, ICXHeader, PSCHeader } from "@lib/common/models/fileaccess.const";
 
 // Set up PouchDB with memory adapter
@@ -186,7 +186,6 @@ describe("EntryManagerImpls", () => {
                 syncInternalFiles: false,
             });
             const host = createHost(services.mockSettingService);
-
             expect(isTargetFile(host, ".hidden.md")).toBe(false);
             expect(isTargetFile(host, ".obsidian/workspace.json")).toBe(false);
             expect(isTargetFile(host, "i:.hidden.md")).toBe(false);
@@ -198,7 +197,6 @@ describe("EntryManagerImpls", () => {
                 syncInternalFiles: true,
             });
             const host = createHost(services.mockSettingService);
-
             expect(isTargetFile(host, ".hidden.md")).toBe(true);
             expect(isTargetFile(host, ".obsidian/workspace.json")).toBe(true);
             expect(isTargetFile(host, "i:.hidden.md")).toBe(true);
@@ -209,7 +207,6 @@ describe("EntryManagerImpls", () => {
                 syncInternalFiles: false,
             });
             const host = createHost(services.mockSettingService);
-
             expect(isTargetFile(host, "ix:device/CONFIG/app.json.md")).toBe(true);
         });
     });

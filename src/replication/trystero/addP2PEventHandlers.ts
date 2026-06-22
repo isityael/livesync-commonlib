@@ -1,6 +1,6 @@
 // P2P replicator helper functions
 import { eventHub, EVENT_DATABASE_REBUILT, EVENT_PLATFORM_UNLOADED, EVENT_SETTING_SAVED } from "@/common/events";
-import type { P2PSyncSetting } from "../../common/types";
+import type { P2PSyncSetting } from "@lib/common/types";
 import type { LiveSyncTrysteroReplicator } from "./LiveSyncTrysteroReplicator";
 import { EVENT_ADVERTISEMENT_RECEIVED, EVENT_DEVICE_LEAVED, EVENT_REQUEST_STATUS } from "./TrysteroReplicatorP2PServer";
 import type { Advertisement } from "./types";
@@ -41,8 +41,15 @@ export function addP2PEventHandlers(instance: P2PReplicatorLike) {
     eventHub.onEvent(EVENT_PLATFORM_UNLOADED, () => {
         void instance.close();
     });
-    eventHub.onEvent(EVENT_SETTING_SAVED, async (_settings: P2PSyncSetting) => {
-        await instance.open();
+    eventHub.onEvent(EVENT_SETTING_SAVED, async (settings: P2PSyncSetting) => {
+        const isOpen = instance.isServing ?? instance.server?.isServing ?? false;
+        if (settings.P2P_Enabled && settings.P2P_AutoStart) {
+            await instance.open();
+            return;
+        }
+        if (isOpen) {
+            await instance.close();
+        }
     });
 }
 

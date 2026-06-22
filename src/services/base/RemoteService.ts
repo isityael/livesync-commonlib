@@ -18,6 +18,7 @@ import type { SettingService } from "@lib/services/base/SettingService";
 import { UnresolvedErrorManager } from "@lib/services/base/UnresolvedErrorManager";
 import { createInstanceLogFunction, MARK_LOG_NETWORK_ERROR, type LogFunction } from "@lib/services/lib/logUtils";
 import { PouchDB } from "@lib/pouchdb/pouchdb-browser.ts";
+import { LiveSyncError } from "@lib/common/LSError";
 export interface RemoteServiceDependencies {
     APIService: APIService;
     appLifecycle: AppLifecycleService;
@@ -154,13 +155,16 @@ export abstract class RemoteService<T extends ServiceContext = ServiceContext>
             adapter: "http",
             auth: "username" in auth ? auth : undefined,
             skip_setup: !performSetup,
-            fetch: async (url: string | Request, opts?: RequestInit) => {
+            fetch: async (requestSrc: string | Request, opts?: RequestInit) => {
+                const url = new URL(typeof requestSrc === "string" ? requestSrc : requestSrc.url);
                 const authHeader = await this._authHeader.getAuthorizationHeader(auth);
                 let size = "";
                 const localURL = url.toString().substring(uri.length);
                 const method = opts?.method ?? "GET";
                 if (opts?.body) {
-                    const opts_length = opts.body.toString().length;
+                    const bodyLength =
+                        typeof opts.body === "string" ? opts.body.length : JSON.stringify(opts.body).length;
+                    const opts_length = isNaN(bodyLength) ? 0 : bodyLength;
                     if (opts_length > 1000 * 1000 * 10) {
                         // over 10MB
                         if (isCloudantURI(uri)) {
@@ -219,7 +223,7 @@ export abstract class RemoteService<T extends ServiceContext = ServiceContext>
                         // }
                         // this.clearErrors();
                         const response = await this.performFetch(
-                            url,
+                            requestSrc,
                             { ...opts, headers },
                             useRequestAPI ? FetchMethod.native : FetchMethod.webCompat
                         );
@@ -237,7 +241,7 @@ export abstract class RemoteService<T extends ServiceContext = ServiceContext>
                             //     ...opts,
                             //     headers,
                             // });
-                            const resp2 = await this.performFetch(url, { ...opts, headers }, FetchMethod.native);
+                            const resp2 = await this.performFetch(requestSrc, { ...opts, headers }, FetchMethod.native);
                             if (resp2.status / 100 == 2) {
                                 this.showError(
                                     "The request was successful by API. But the native fetch API failed! Please check CORS settings on the remote database!. While this condition, you cannot enable LiveSync",
@@ -252,7 +256,7 @@ export abstract class RemoteService<T extends ServiceContext = ServiceContext>
                         }
                         throw ex;
                     }
-                } catch (ex: any) {
+                } catch (ex) {
                     this._log(`HTTP:${method}${size} to:${localURL} -> failed`, LOG_LEVEL_VERBOSE);
                     const msg = ex instanceof Error ? `${ex?.name}:${ex?.message}` : ex?.toString();
                     this.showError(`${MARK_LOG_NETWORK_ERROR}Network Error: Failed to fetch: ${msg}`, LOG_LEVEL_INFO); // Do not show notice, due to throwing below
@@ -282,8 +286,9 @@ export abstract class RemoteService<T extends ServiceContext = ServiceContext>
         try {
             const info = await db.info();
             return { db: db, info: info };
-        } catch (ex: any) {
-            const msg = `${ex?.name}:${ex?.message}`;
+        } catch (ex) {
+            const exMsg = ex instanceof Error ? ex : LiveSyncError.fromError(ex);
+            const msg = `${exMsg.name}:${exMsg.message}`;
             this._log(ex, LOG_LEVEL_VERBOSE);
             return msg;
         }

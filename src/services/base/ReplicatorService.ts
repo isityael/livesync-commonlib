@@ -3,7 +3,7 @@ import { handlers } from "@lib/services/lib/HandlerUtils";
 import type { IReplicatorService } from "./IService";
 import { ServiceBase, type ServiceContext } from "./ServiceBase";
 import type { SettingService } from "./SettingService";
-import { createInstanceLogFunction } from "../lib/logUtils";
+import { createInstanceLogFunction } from "@lib/services/lib/logUtils";
 import type { AppLifecycleService } from "./AppLifecycleService";
 import { UnresolvedErrorManager } from "./UnresolvedErrorManager";
 import { $msg } from "@lib/common/i18n";
@@ -11,7 +11,7 @@ import { yieldMicrotask } from "octagonal-wheels/promises";
 import type { DatabaseEventService } from "./DatabaseEventService";
 import { LOG_LEVEL_NOTICE, LOG_LEVEL_VERBOSE } from "@lib/common/logger";
 import { RemoteTypes } from "@lib/common/types";
-import { DEFAULT_REPLICATION_STATICS } from "../../common/models/shared.definition";
+import { DEFAULT_REPLICATION_STATICS } from "@lib/common/models/shared.definition";
 import { reactiveSource } from "octagonal-wheels/dataobject/reactive";
 
 export interface ReplicatorServiceDependencies {
@@ -69,7 +69,7 @@ export abstract class ReplicatorService<T extends ServiceContext = ServiceContex
     private async disposeReplicator() {
         this._log("Detect database reset, closing active replicator if exists.");
         if (this._activeReplicator) {
-            await this._activeReplicator.closeReplication();
+            await Promise.resolve(this._activeReplicator.closeReplication());
         }
         // To flush e2ee salts, device id, and other information kept in the replicator instance, to avoid potential database corruption after reset.
 
@@ -90,11 +90,14 @@ export abstract class ReplicatorService<T extends ServiceContext = ServiceContex
             return true;
         }
         const replicatorType = setting.remoteType;
-        const hasReplicatorConfig =
-            (replicatorType === RemoteTypes.REMOTE_COUCHDB &&
-                !!setting.couchDB_URI?.trim() &&
-                !!setting.couchDB_DBNAME?.trim()) ||
-            (replicatorType === RemoteTypes.REMOTE_MINIO && !!setting.endpoint?.trim() && !!setting.bucket?.trim());
+        const isCouchDBConfigured =
+            replicatorType === RemoteTypes.REMOTE_COUCHDB &&
+            !!setting.couchDB_URI?.trim() &&
+            !!setting.couchDB_DBNAME?.trim();
+        const isMinioConfigured =
+            replicatorType === RemoteTypes.REMOTE_MINIO && !!setting.endpoint?.trim() && !!setting.bucket?.trim();
+        const isP2PEnabled = replicatorType === RemoteTypes.REMOTE_P2P && setting.P2P_Enabled;
+        const hasReplicatorConfig = isCouchDBConfigured || isMinioConfigured || isP2PEnabled;
 
         if (!hasReplicatorConfig) {
             this._activeReplicator = undefined;
@@ -118,7 +121,7 @@ export abstract class ReplicatorService<T extends ServiceContext = ServiceContex
             }
             // Check existing replicator and close it if exists.
             if (this._activeReplicator) {
-                await this._activeReplicator.closeReplication();
+                await Promise.resolve(this._activeReplicator.closeReplication());
                 this._log("Active replicator closed", LOG_LEVEL_VERBOSE);
             }
             this._activeReplicator = newReplicator;

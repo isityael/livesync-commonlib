@@ -3,10 +3,10 @@
 //
 // The Security Seed (represented as PBKDF2 Salt in logs) derives the encryption key for replication, so it should be stored on the server prior to synchronisation.
 import { createPBKDF2Salt } from "octagonal-wheels/encryption/hkdf";
-import { LOG_LEVEL_INFO, LOG_LEVEL_VERBOSE, Logger } from "../common/logger.ts";
-import type { SyncParameters } from "../common/types.ts";
-import { arrayBufferToBase64Single, base64ToArrayBufferInternalBrowser } from "../string_and_binary/convert.ts";
-import { LiveSyncError } from "../common/LSError.ts";
+import { LOG_LEVEL_INFO, LOG_LEVEL_VERBOSE, Logger } from "@lib/common/logger.ts";
+import type { SyncParameters } from "@lib/common/types.ts";
+import { arrayBufferToBase64Single, base64ToArrayBufferInternalBrowser } from "@lib/string_and_binary/convert.ts";
+import { LiveSyncError } from "@lib/common/LSError.ts";
 
 /**
  * Creates a SyncParamsHandler for managing synchronisation parameters.
@@ -76,7 +76,7 @@ function createSyncParamsHandler({ put, get, create }: CreateSyncParamsHanderOpt
                 try {
                     syncParams = await get();
                     Logger(`Fetched synchronisation parameters`, LOG_LEVEL_INFO);
-                } catch (ex: any) {
+                } catch (ex) {
                     if (LiveSyncError.isCausedBy(ex, SyncParamsNotFoundError)) {
                         // Expected error; we will create new synchronisation parameters.
                         Logger(`Synchronisation parameters not found, creating new ones`, LOG_LEVEL_INFO);
@@ -138,7 +138,7 @@ function createSyncParamsHandler({ put, get, create }: CreateSyncParamsHanderOpt
                 syncParams.pbkdf2saltDecoded = decodedSalt;
             }
             return syncParams;
-        } catch (ex: any) {
+        } catch (ex) {
             Logger(`Failed to fetch synchronisation parameters`, LOG_LEVEL_INFO);
             Logger(ex, LOG_LEVEL_VERBOSE);
             // To retry fetching synchronisation parameters in the next call.

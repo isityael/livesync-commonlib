@@ -6,12 +6,12 @@ import {
     REMOTE_COUCHDB,
     type SavingEntry,
     type MetaEntry,
-} from "../../common/types";
-import type { ChunkManager } from "../ChunkManager";
-import type { ContentSplitter } from "../../ContentSplitter/ContentSplitters";
-import type { HashManager } from "../HashManager/HashManager";
-import type { GeneratedChunk } from "../../pouchdb/LiveSyncLocalDB";
-import type { IPathService, ISettingService } from "../../services/base/IService";
+} from "@lib/common/types";
+import type { ChunkManager } from "@lib/managers/ChunkManager";
+import type { ContentSplitter } from "@lib/ContentSplitter/ContentSplitters";
+import type { HashManager } from "@lib/managers/HashManager/HashManager";
+import type { GeneratedChunk } from "@lib/pouchdb/LiveSyncLocalDB";
+import type { IPathService, ISettingService } from "@lib/services/base/IService";
 import {
     deleteDBEntryByPath,
     getDBEntryByPath,
@@ -107,7 +107,7 @@ export class EntryManager {
         return await deleteDBEntryByPath(this.serviceHost, this, path, opt);
     }
 
-    async putDBEntry(note: SavingEntry, onlyChunks?: boolean) {
-        return await putDBEntry(this.serviceHost, this, note, onlyChunks);
+    async putDBEntry(note: SavingEntry, onlyChunks?: boolean, conflictBaseRev?: string) {
+        return await putDBEntry(this.serviceHost, this, note, onlyChunks, conflictBaseRev);
     }
 }
