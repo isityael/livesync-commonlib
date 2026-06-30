@@ -17,7 +17,7 @@ Forgejo is the source of truth:
 
 GitHub is maintained as a public push mirror:
 
-- `https://github.com/yaelmoshi/livesync-commonlib`
+- `https://github.com/isityael/livesync-commonlib`
 
 ## Development
 
