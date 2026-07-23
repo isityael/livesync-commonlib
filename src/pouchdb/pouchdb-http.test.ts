@@ -118,3 +118,27 @@ Deno.test("PouchDB HTTP facade normalizes CouchDB errors", async () => {
         globalThis.fetch = originalFetch;
     }
 });
+
+Deno.test("PouchDB live changes normalizes an empty since checkpoint", async () => {
+    const originalFetch = globalThis.fetch;
+    let requestedSince: string | null = null;
+    let changes: ReturnType<PouchDB["changes"]>;
+
+    globalThis.fetch = (input) => {
+        const url = new URL(input instanceof Request ? input.url : String(input));
+        requestedSince = url.searchParams.get("since");
+        queueMicrotask(() => changes.cancel());
+        return Promise.resolve(jsonResponse({ results: [], last_seq: "0" }));
+    };
+
+    try {
+        const db = new PouchDB("https://couch.example/vault");
+        changes = db.changes({ since: "", live: true });
+
+        await changes;
+
+        assert(requestedSince === "0", "expected an empty since checkpoint to start at sequence zero");
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});

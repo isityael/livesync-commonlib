@@ -141,6 +141,11 @@ class CouchChanges<T extends object> extends MinimalEventEmitter implements Prom
     ) {
         super();
         this.promise = this.run();
+        // Event-style consumers subscribe with .on("error") and do not await
+        // this thenable. Mark the internal rejection as observed so a
+        // transient CouchDB/network error does not terminate the Node process;
+        // awaiting the original promise still rejects as expected.
+        void this.promise.catch(() => undefined);
     }
 
     cancel(): void {
@@ -176,7 +181,8 @@ class CouchChanges<T extends object> extends MinimalEventEmitter implements Prom
     }
 
     private async runLive(): Promise<any> {
-        let since = this.options.since ?? "now";
+        const initialSince = this.options.since;
+        let since = initialSince === "" ? "0" : initialSince ?? "now";
         do {
             const response = await this.db.requestChanges(
                 {
