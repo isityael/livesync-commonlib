@@ -119,6 +119,23 @@ Deno.test("PouchDB HTTP facade normalizes CouchDB errors", async () => {
     }
 });
 
+Deno.test("PouchDB HTTP facade gives per-document conflicts a 409 status", async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = () => Promise.resolve(jsonResponse([
+        { id: "existing", error: "conflict", reason: "Document update conflict." },
+        { id: "broken", error: "forbidden", reason: "write denied" },
+    ], 201));
+    try {
+        const db = new PouchDB("https://couch.example/vault");
+        const results = await db.bulkDocs([{ _id: "existing" }, { _id: "broken" }]);
+        assert(results[0].status === 409, "expected conflict status 409");
+        assert(results[0].id === "existing" && results[0].reason === "Document update conflict.", "expected conflict details");
+        assert(results[1].status === undefined, "unknown errors must remain failures");
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
 Deno.test("PouchDB live changes normalizes an empty since checkpoint", async () => {
     const originalFetch = globalThis.fetch;
     let requestedSince: string | null = null;

@@ -288,9 +288,16 @@ export class PouchDB<T extends object = any> extends MinimalEventEmitter {
         options: Record<string, any> = {},
     ): Promise<any[]> {
         const prepared = await Promise.all(docs.map((doc) => this.prepareIncomingForWrite({ ...doc }, options)));
-        return await this.requestJson(["_bulk_docs"], {}, "POST", {
+        const results = await this.requestJson(["_bulk_docs"], {}, "POST", {
             docs: prepared,
             new_edits: options.new_edits,
+        });
+        // CouchDB sends per-document errors in a successful HTTP response.
+        // PouchDB callers expect each error to carry its own numeric status.
+        return results.map((result: any) => {
+            if (!result?.error || typeof result.status === "number") return result;
+            if (result.error === "conflict") return { ...result, status: 409 };
+            return result;
         });
     }
 
