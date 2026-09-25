@@ -153,6 +153,43 @@ export async function createChunks(
     return chunks;
 }
 
+export async function putEntryDocumentWithRetry(
+    localDatabase: PouchDB.Database<EntryDoc>,
+    newDoc: PlainEntry | NewEntry,
+    conflictBaseRev?: string,
+    dispFilename = newDoc.path
+): Promise<{ ok: boolean; id: string; rev: string } | false> {
+    // Replication can advance this document between get and put.
+    for (let attempt = 0; attempt < 5; attempt++) {
+        if (conflictBaseRev) {
+            newDoc._rev = conflictBaseRev;
+        } else {
+            try {
+                const old = await localDatabase.get(newDoc._id);
+                newDoc._rev = old._rev;
+            } catch (ex) {
+                if (isErrorOfMissingDoc(ex)) {
+                    delete newDoc._rev;
+                } else {
+                    throw ex;
+                }
+            }
+        }
+        try {
+            const result = await localDatabase.put<PlainEntry | NewEntry>(newDoc, { force: true });
+            return result.ok ? result : false;
+        } catch (ex) {
+            if ((ex as { status?: number }).status !== 409) throw ex;
+            if (conflictBaseRev) return false;
+            if (attempt === 4) {
+                Logger(`Document write still conflicts for ${dispFilename}`, LOG_LEVEL_NOTICE);
+                return false;
+            }
+        }
+    }
+    return false;
+}
+
 export async function putDBEntry(
     host: NecessaryServicesInterfaces<"path" | "setting", never>,
     managers: NecessaryManagers<"localDatabase" | "chunkManager" | "hashManager" | "splitter">,
@@ -208,28 +245,9 @@ export async function putDBEntry(
         };
 
         return (
-            (await serialized("file:" + filename, async () => {
-                if (conflictBaseRev) {
-                    newDoc._rev = conflictBaseRev;
-                } else {
-                    try {
-                        const old = await localDatabase.get(newDoc._id);
-                        newDoc._rev = old._rev;
-                    } catch (ex) {
-                        if (isErrorOfMissingDoc(ex)) {
-                            // NO OP/
-                        } else {
-                            throw ex;
-                        }
-                    }
-                }
-                const r = await localDatabase.put<PlainEntry | NewEntry>(newDoc, { force: true });
-                if (r.ok) {
-                    return r;
-                } else {
-                    return false;
-                }
-            })) ?? false
+            (await serialized("file:" + filename, () =>
+                putEntryDocumentWithRetry(localDatabase, newDoc, conflictBaseRev, dispFilename)
+            )) ?? false
         );
     });
     if (result === false) {
