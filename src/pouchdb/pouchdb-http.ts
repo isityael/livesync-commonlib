@@ -30,10 +30,13 @@ type PurgeMultiResult = {
 type PurgeMultiParam = [docId: string, rev$$1: string];
 
 function encodeDocId(id: string): string {
-    return id
-        .split("/")
-        .map((part) => encodeURIComponent(part))
-        .join("/");
+    // Ordinary document IDs may contain slashes. CouchDB treats literal
+    // slashes as URL routing separators, so encode the entire ID.
+    if (id.startsWith("_design/") || id.startsWith("_local/")) {
+        const separator = id.indexOf("/");
+        return `${id.slice(0, separator)}/${encodeURIComponent(id.slice(separator + 1))}`;
+    }
+    return encodeURIComponent(id);
 }
 
 function appendPurgeSeqs(db: PouchDB.Database, docs: PurgeMultiParam[]) {

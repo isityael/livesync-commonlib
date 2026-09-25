@@ -136,6 +136,28 @@ Deno.test("PouchDB HTTP facade gives per-document conflicts a 409 status", async
     }
 });
 
+Deno.test("PouchDB HTTP facade encodes slashes in ordinary document IDs", async () => {
+    const originalFetch = globalThis.fetch;
+    const paths: string[] = [];
+    globalThis.fetch = (input, init = {}) => {
+        const url = new URL(input instanceof Request ? input.url : String(input));
+        paths.push(url.pathname);
+        if (init.method === "PUT") return Promise.resolve(jsonResponse({ ok: true, id: "folder/note.md", rev: "2-ok" }, 201));
+        return Promise.resolve(jsonResponse({ _id: "folder/note.md", _rev: "1-old" }));
+    };
+    try {
+        const db = new PouchDB("https://couch.example/vault");
+        const old = await db.get("folder/note.md");
+        await db.put({ _id: "folder/note.md", _rev: old._rev });
+        await db.get("_local/checkpoint");
+        assert(paths.length === 3, "expected two GETs and a PUT");
+        assert(paths.slice(0, 2).every((path) => path === "/vault/folder%2Fnote.md"), "ordinary document slashes must be encoded");
+        assert(paths[2] === "/vault/_local/checkpoint", "reserved local document routing must be preserved");
+    } finally {
+        globalThis.fetch = originalFetch;
+    }
+});
+
 Deno.test("PouchDB live changes normalizes an empty since checkpoint", async () => {
     const originalFetch = globalThis.fetch;
     let requestedSince: string | null = null;
