@@ -2,10 +2,10 @@ import {
     type EntryDoc,
     type DatabaseConnectingStatus,
     type RemoteDBSettings,
-    type EntryLeaf,
     type EntryNodeInfo,
     NODEINFO_DOCID,
     type TweakValues,
+    type RemotePreferredTweakResult,
     type NodeData,
 } from "@lib/common/types.ts";
 
@@ -13,6 +13,9 @@ import { LOG_LEVEL_INFO, LOG_LEVEL_NOTICE, LOG_LEVEL_VERBOSE, Logger } from "@li
 import { resolveWithIgnoreKnownError } from "@lib/common/utils.ts";
 import { arrayBufferToBase64Single } from "@lib/string_and_binary/convert.ts";
 import type { RequiredServices } from "@lib/interfaces/ServiceModule";
+import type { TranslationParameters } from "@lib/services/base/MessageTranslator";
+import type { CommonlibMessageKey } from "@lib/services/base/CommonlibMessages";
+import type { ReplicatorInstance } from "./ReplicatorInstance.ts";
 // import type { IServiceHub } from "@lib/services/base/IService.ts";
 
 export type ReplicationCallback = (e: PouchDB.Core.ExistingDocument<EntryDoc>[]) => Promise<boolean> | boolean;
@@ -25,6 +28,14 @@ export type ReplicationStat = {
     lastSyncPushSeq: number;
     syncStatus: DatabaseConnectingStatus;
 };
+
+/**
+ * Constructor environment shared by the legacy concrete Replicator facades.
+ *
+ * This compatibility boundary supplies host services to those facades. Active
+ * provider capabilities and their ownership are declared separately by the
+ * replication provider contracts.
+ */
 export interface LiveSyncReplicatorEnv {
     services: RequiredServices<
         | "API"
@@ -47,7 +58,14 @@ export type RemoteDBStatus = {
     estimatedSize?: number;
 };
 
-export abstract class LiveSyncAbstractReplicator {
+/**
+ * Legacy compatibility facade around the small active Replicator contract.
+ *
+ * New active-provider control flow depends only on {@link ReplicatorInstance}.
+ * The additional abstract members remain temporarily for existing maintenance
+ * and setup consumers and are not capabilities promised by every provider.
+ */
+export abstract class LiveSyncAbstractReplicator implements ReplicatorInstance {
     syncStatus: DatabaseConnectingStatus = "NOT_CONNECTED";
     docArrived = 0;
     docSent = 0;
@@ -66,8 +84,6 @@ export abstract class LiveSyncAbstractReplicator {
     tweakSettingsMismatched = false;
     preferredTweakValue?: TweakValues;
 
-    abstract get isChunkSendingSupported(): boolean;
-
     get database() {
         return this.env.services.database.localDatabase;
     }
@@ -76,6 +92,9 @@ export abstract class LiveSyncAbstractReplicator {
     }
     get currentSettings() {
         return this.env.services.setting.currentSettings();
+    }
+    protected translate(key: CommonlibMessageKey, params?: TranslationParameters): string {
+        return this.env.services.context.translate(key, params);
     }
     sendChunks(
         setting: RemoteDBSettings,
@@ -136,7 +155,7 @@ export abstract class LiveSyncAbstractReplicator {
         // initialize local node information.
     }
 
-    abstract terminateSync(): void;
+    abstract terminateSync(): void | Promise<void>;
 
     abstract openReplication(
         setting: RemoteDBSettings,
@@ -158,13 +177,9 @@ export abstract class LiveSyncAbstractReplicator {
     };
 
     abstract tryConnectRemote(setting: RemoteDBSettings, showResult?: boolean): Promise<boolean>;
-    abstract replicateAllToServer(
-        setting: RemoteDBSettings,
-        showingNotice?: boolean,
-        sendChunksInBulkDisabled?: boolean
-    ): Promise<boolean>;
+    abstract replicateAllToServer(setting: RemoteDBSettings, showingNotice?: boolean): Promise<boolean>;
     abstract replicateAllFromServer(setting: RemoteDBSettings, showingNotice?: boolean): Promise<boolean>;
-    abstract closeReplication(): void;
+    abstract closeReplication(): void | Promise<void>;
 
     abstract tryResetRemoteDatabase(setting: RemoteDBSettings): Promise<void>;
     abstract tryCreateRemoteDatabase(setting: RemoteDBSettings): Promise<void>;
@@ -174,12 +189,8 @@ export abstract class LiveSyncAbstractReplicator {
     abstract resetRemoteTweakSettings(setting: RemoteDBSettings): Promise<void>;
     abstract setPreferredRemoteTweakSettings(setting: RemoteDBSettings): Promise<void>;
 
-    abstract fetchRemoteChunks(missingChunks: string[], showResult: boolean): Promise<false | EntryLeaf[]>;
-
     abstract getRemoteStatus(setting: RemoteDBSettings): Promise<false | RemoteDBStatus>;
-    abstract getRemotePreferredTweakValues(setting: RemoteDBSettings): Promise<false | TweakValues>;
-
-    abstract countCompromisedChunks(setting?: RemoteDBSettings): Promise<number | boolean>;
+    abstract getRemotePreferredTweakValues(setting: RemoteDBSettings): Promise<RemotePreferredTweakResult>;
 
     abstract getConnectedDeviceList(
         setting?: RemoteDBSettings

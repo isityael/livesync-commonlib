@@ -11,7 +11,7 @@ import {
     type UXFolderInfo,
     type UXInternalFileInfoStub,
 } from "@lib/common/types.ts";
-import { delay, fireAndForget, throttle } from "@lib/common/utils.ts";
+import { delay, fireAndForget, isRemediationModeActive, throttle } from "@lib/common/utils.ts";
 import { type FileEventItem } from "@lib/common/types.ts";
 import { serialized, skipIfDuplicated } from "octagonal-wheels/concurrency/lock";
 import { isWaitingForTimeout } from "octagonal-wheels/concurrency/task";
@@ -38,6 +38,9 @@ type FileEventItemSentinelFlush = {
     type: typeof TYPE_SENTINEL_FLUSH;
 };
 export type FileEventItemSentinel = FileEventItemSentinelFlush;
+type RunQueuedEventsOptions = {
+    waitForProcessing?: boolean;
+};
 export interface StorageEventManagerBaseDependencies {
     setting: SettingService;
     vaultService: IVaultService;
@@ -135,14 +138,12 @@ export abstract class StorageEventManagerBase<
 
     /**
      * Snapshot restoration promise.
-     * Snapshot will be restored before starting to watch vault changes.
-     * In designed time, this has been called from Initialisation process, which has been implemented on `ModuleInitializerFile.ts`.
+     * It resolves after the restored file operations have finished, before Vault watching begins.
      */
     snapShotRestored: Promise<void> | null = null;
 
     /**
-     * Restore the previous snapshot if exists.
-     * @returns
+     * Restore and complete the previous storage-event snapshot when it exists.
      */
     restoreState(): Promise<void> {
         this.snapShotRestored = this._restoreFromSnapshot();
@@ -152,34 +153,70 @@ export abstract class StorageEventManagerBase<
         const settings = this.settings;
         if (!settings.isConfigured) return;
         if (settings.suspendFileWatching) return;
-        if (settings.maxMTimeForReflectEvents > 0) {
+        if (isRemediationModeActive(settings)) {
             return;
         }
         this.fileProcessing.onStorageFileEvent();
         // Flag up to be reload
         for (const param of params) {
-            if (shouldBeIgnored(param.file.path)) {
-                continue;
-            }
             const atomicKey = [0, 0, 0, 0, 0, 0].map((e) => `${Math.floor(Math.random() * 100000)}`).join("-");
-            const type = param.type;
-            const file = param.file;
+            let type = param.type;
+            let file = param.file;
             const oldPath = param.oldPath;
-            if (type !== "INTERNAL") {
-                const size = (file as UXFileInfoStub).stat.size;
-                if (this.vaultService.isFileSizeTooLarge(size) && (type == "CREATE" || type == "CHANGED")) {
-                    this._log(
-                        `The storage file has been changed but exceeds the maximum size. Skipping: ${param.file.path}`,
-                        LOG_LEVEL_NOTICE
-                    );
-                    continue;
-                }
-            }
+
             if (this.isFolder(file)) {
                 this._log(`Folder event skipped: ${file.path}`, LOG_LEVEL_VERBOSE);
                 continue;
             }
-            if (!(await this.vaultService.isTargetFile(file.path))) continue;
+
+            const isTargetPath = async (path: string): Promise<boolean> => {
+                if (shouldBeIgnored(path)) return false;
+                if (!settings.syncInternalFiles && path.startsWith(".")) return false;
+                return await this.vaultService.isTargetFile(path);
+            };
+
+            if (type === "RENAME") {
+                const renamedFile = file as UXFileInfoStub;
+                if (!oldPath || !this.isFile(file) || !renamedFile.stat) {
+                    this._log(`Invalid rename event skipped: ${file.path}`, LOG_LEVEL_VERBOSE);
+                    continue;
+                }
+                const oldPathIsTarget = await isTargetPath(oldPath);
+                let newPathIsTarget = await isTargetPath(file.path);
+                if (newPathIsTarget && this.vaultService.isFileSizeTooLarge(renamedFile.stat.size)) {
+                    this._log(
+                        `The storage file has been changed but exceeds the maximum size. Skipping: ${param.file.path}`,
+                        LOG_LEVEL_NOTICE
+                    );
+                    newPathIsTarget = false;
+                }
+                if (!oldPathIsTarget && !newPathIsTarget) {
+                    continue;
+                }
+                if (oldPathIsTarget && !newPathIsTarget) {
+                    type = "DELETE";
+                    file = {
+                        path: oldPath as FilePath,
+                        name: oldPath.split("/").pop() ?? file.name,
+                        stat: renamedFile.stat,
+                        deleted: true,
+                    };
+                } else if (!oldPathIsTarget && newPathIsTarget) {
+                    type = "CREATE";
+                }
+            } else {
+                if (!(await isTargetPath(file.path))) continue;
+                if (type !== "INTERNAL") {
+                    const size = (file as UXFileInfoStub).stat.size;
+                    if (this.vaultService.isFileSizeTooLarge(size) && (type == "CREATE" || type == "CHANGED")) {
+                        this._log(
+                            `The storage file has been changed but exceeds the maximum size. Skipping: ${param.file.path}`,
+                            LOG_LEVEL_NOTICE
+                        );
+                        continue;
+                    }
+                }
+            }
 
             // Stop cache using to prevent the corruption;
             // let cache: null | string | ArrayBuffer;
@@ -187,7 +224,7 @@ export abstract class StorageEventManagerBase<
             // if (file instanceof TFile && (type == "CREATE" || type == "CHANGED")) {
             // if (file instanceof TFile || !file.isFolder) {
             if (this.isFile(file)) {
-                if (type == "CREATE" || type == "CHANGED") {
+                if (type == "CREATE" || type == "CHANGED" || type == "RENAME") {
                     // Wait for a bit while to let the writer has marked `touched` at the file.
                     await delay(10);
                     if (
@@ -209,7 +246,8 @@ export abstract class StorageEventManagerBase<
                 type,
                 args: {
                     file: file,
-                    oldPath,
+                    oldPath: type === "RENAME" ? oldPath : undefined,
+                    ...(param.type === "RENAME" && type === "DELETE" ? { renameTarget: param.file.path } : {}),
                     cache,
                     ctx,
                 },
@@ -223,8 +261,8 @@ export abstract class StorageEventManagerBase<
     protected bufferedQueuedItems = [] as (FileEventItem | FileEventItemSentinel)[];
 
     enqueue(newItem: FileEventItem) {
-        if (newItem.type == "DELETE") {
-            // If the sentinel pushed, the runQueuedEvents will wait for idle before processing delete.
+        if (newItem.type == "DELETE" || newItem.type == "RENAME") {
+            // If the sentinel pushed, the runQueuedEvents will wait for idle before processing delete or rename.
             this.bufferedQueuedItems.push({
                 type: TYPE_SENTINEL_FLUSH,
             });
@@ -457,17 +495,51 @@ export abstract class StorageEventManagerBase<
             this._log(`Restoring storage operation snapshot: ${snapShot.length} items`, LOG_LEVEL_VERBOSE);
             // Restore the snapshot
             // Note: Mark all items as skipBatchWait to prevent apply the off-line batch saving.
-            this.bufferedQueuedItems = snapShot.map((e) => ({ ...e, skipBatchWait: true }));
+            this.bufferedQueuedItems = snapShot.map((event) =>
+                event.type === TYPE_SENTINEL_FLUSH
+                    ? event
+                    : { ...event, restoredFromPreviousRuntime: true, skipBatchWait: true }
+            );
             this.updateStatus();
-            await this.runQueuedEvents();
+            // A restored snapshot is part of start-up reconciliation. Wait until its
+            // actual file operations finish so that the following full scan observes
+            // their results rather than racing with fire-and-forget work.
+            await this.runQueuedEvents({ waitForProcessing: true });
         } else {
             this._log(`No snapshot to restore`, LOG_LEVEL_VERBOSE);
             // console.warn(`No snapshot to restore`);
         }
     }
 
-    protected runQueuedEvents() {
+    /**
+     * Dispatch buffered storage events.
+     *
+     * Ordinary watcher events retain the existing fire-and-forget behaviour.
+     * Snapshot restoration requests completion so its caller can use the replay as
+     * a lifecycle boundary. In that mode, a sentinel also waits for every operation
+     * dispatched before it, preserving the ordering represented by the snapshot.
+     * An individual restored operation failure is logged but does not prevent the
+     * following Offline Scanner from reconciling the resulting current state.
+     */
+    protected runQueuedEvents(options: RunQueuedEventsOptions = {}) {
+        const waitForProcessing = options.waitForProcessing ?? false;
         return skipIfDuplicated("storage-event-manager-run-queued-events", async () => {
+            let dispatched: { path: string; processing: Promise<void> }[] = [];
+            const waitForDispatched = async () => {
+                if (dispatched.length === 0) return;
+                const pending = dispatched;
+                dispatched = [];
+                const results = await Promise.allSettled(pending.map(({ processing }) => processing));
+                for (const [index, result] of results.entries()) {
+                    if (result.status === "rejected") {
+                        this._log(
+                            `Restored storage operation failed for ${pending[index].path}; the Offline Scanner will reconcile the current state`,
+                            LOG_LEVEL_NOTICE
+                        );
+                        this._log(result.reason, LOG_LEVEL_VERBOSE);
+                    }
+                }
+            };
             do {
                 if (this.bufferedQueuedItems.length === 0) {
                     break;
@@ -486,14 +558,25 @@ export abstract class StorageEventManagerBase<
                 //    If sentinel, wait for idle and continue.
                 if (fei.type === TYPE_SENTINEL_FLUSH) {
                     this._log(`Waiting for idle`, LOG_LEVEL_VERBOSE);
+                    if (waitForProcessing) {
+                        await waitForDispatched();
+                    }
                     // Flush all waiting batch queues
                     await this.waitForIdle();
                     this.updateStatus();
                     continue;
                 }
                 // 4. Process the event, this should be fire-and-forget to not block the queue processing in each file.
-                fireAndForget(() => this.processFileEvent(fei));
+                const processing = this.processFileEvent(fei);
+                if (waitForProcessing) {
+                    dispatched.push({ path: fei.args.file.path, processing });
+                } else {
+                    fireAndForget(processing);
+                }
             } while (this.bufferedQueuedItems.length > 0);
+            if (waitForProcessing) {
+                await waitForDispatched();
+            }
         });
     }
 
@@ -649,16 +732,11 @@ export abstract class StorageEventManagerBase<
             void this.appendQueue(
                 [
                     {
-                        type: "DELETE",
-                        file: {
-                            path: oldPath as FilePath,
-                            name: fileInfo.name,
-                            stat: fileInfo.stat,
-                            deleted: true,
-                        },
+                        type: "RENAME",
+                        file: fileInfo,
+                        oldPath,
                         skipBatchWait: true,
                     },
-                    { type: "CREATE", file: fileInfo, skipBatchWait: true },
                 ],
                 ctx
             );

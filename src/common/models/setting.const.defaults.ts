@@ -1,4 +1,12 @@
-import { ChunkAlgorithms, CURRENT_SETTING_VERSION, E2EEAlgorithms, REMOTE_COUCHDB } from "./setting.const";
+import {
+    ChunkAlgorithms,
+    CURRENT_SETTING_VERSION,
+    E2EEAlgorithms,
+    P2PConnectionPaths,
+    P2PMessageSizePresets,
+    REMOTE_COUCHDB,
+} from "./setting.const";
+import { PREFERRED_BASE } from "./setting.const.preferred";
 import { AutoAccepting, type ObsidianLiveSyncSettings, type P2PSyncSetting } from "./setting.type";
 import type { CustomRegExpSourceList } from "./shared.type.util";
 
@@ -22,10 +30,18 @@ export const P2P_DEFAULT_SETTINGS: P2PSyncSetting = {
     P2P_turnServers: "",
     P2P_turnUsername: "",
     P2P_turnCredential: "",
+    P2P_maxWirePayloadBytes: P2PMessageSizePresets.Standard,
+    P2P_connectionPath: P2PConnectionPaths.Automatic,
     P2P_useDiagRTC: false,
 } as const;
 
-export const DEFAULT_SETTINGS: ObsidianLiveSyncSettings = {
+/**
+ * Conservative fallback values used to complete stored settings.
+ *
+ * Keep these values compatible with existing installations. Defaults intended
+ * only for a newly created Vault belong in {@link NEW_VAULT_SETTINGS}.
+ */
+export const SETTINGS_SCHEMA_DEFAULTS: ObsidianLiveSyncSettings = {
     remoteType: REMOTE_COUCHDB,
     useCustomRequestHandler: false,
     couchDB_URI: "",
@@ -49,7 +65,10 @@ export const DEFAULT_SETTINGS: ObsidianLiveSyncSettings = {
     syncOnFileOpen: false,
     encrypt: false,
     passphrase: "",
+    idDerivationVersion: 0,
+    idDerivationKey: "",
     usePathObfuscation: false,
+    encryptInternalMetadata: false,
     doNotDeleteFolder: false,
     resolveConflictsByNewerFile: false,
     batchSave: false,
@@ -97,6 +116,7 @@ export const DEFAULT_SETTINGS: ObsidianLiveSyncSettings = {
     syncAfterMerge: false,
     configPassphraseStore: "",
     encryptedPassphrase: "",
+    encryptedIdDerivationKey: "",
     encryptedCouchDBConnection: "",
     permitEmptyPassphrase: false,
     remoteConfigurations: {},
@@ -117,6 +137,8 @@ export const DEFAULT_SETTINGS: ObsidianLiveSyncSettings = {
     ignoreFiles: ".gitignore",
     syncOnEditorSave: false,
     keepReplicationActiveInBackground: false,
+    allowSleepDuringSynchronisation: false,
+    allowSleepDuringSynchronisationOnDesktop: true,
     pluginSyncExtendedSetting: {},
     syncMaxSizeInMB: 50,
     settingSyncFile: "",
@@ -150,6 +172,7 @@ export const DEFAULT_SETTINGS: ObsidianLiveSyncSettings = {
     handleFilenameCaseSensitive: undefined!,
     doNotUseFixedRevisionForChunks: true,
     showLongerLogInsideEditor: false,
+    /** @deprecated Retained for settings and Setup URI compatibility. */
     sendChunksBulk: false,
     sendChunksBulkMaxSize: 1,
     /**
@@ -185,3 +208,31 @@ export const DEFAULT_SETTINGS: ObsidianLiveSyncSettings = {
     maxMTimeForReflectEvents: 0,
     tweakModified: undefined,
 };
+
+/**
+ * Initial values for a Vault which has never stored Self-hosted LiveSync settings.
+ *
+ * This object is deliberately separate from schema fallbacks so that future
+ * releases can improve new-user defaults without changing existing choices.
+ */
+export const NEW_VAULT_SETTINGS: ObsidianLiveSyncSettings = {
+    ...SETTINGS_SCHEMA_DEFAULTS,
+    ...PREFERRED_BASE,
+    encryptInternalMetadata: true,
+    remoteConfigurations: {},
+    pluginSyncExtendedSetting: {},
+};
+
+/** Create an independently mutable copy of the current new-Vault settings. */
+export function createNewVaultSettings(): ObsidianLiveSyncSettings {
+    return {
+        ...NEW_VAULT_SETTINGS,
+        remoteConfigurations: {},
+        pluginSyncExtendedSetting: {},
+    };
+}
+
+/**
+ * Compatibility name for the conservative setting-schema fallbacks.
+ */
+export const DEFAULT_SETTINGS = SETTINGS_SCHEMA_DEFAULTS;

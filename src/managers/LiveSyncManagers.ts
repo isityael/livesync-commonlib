@@ -6,8 +6,8 @@ import { ChunkManager } from "@lib/managers/ChunkManager.ts";
 import { ConflictManager } from "@lib/managers/ConflictManager.ts";
 import { EntryManager } from "@lib/managers/EntryManager/EntryManager.ts";
 import { HashManager } from "@lib/managers/HashManager/HashManager.ts";
-import type { APIService } from "@lib/services/base/APIService.ts";
 import type {
+    IAPIService,
     IDatabaseService,
     IPathService,
     IReplicatorService,
@@ -21,13 +21,13 @@ export interface LiveSyncManagersOptions<TSettingService extends ISettingService
     settingService: TSettingService;
     pathService: IPathService;
     replicatorService: IReplicatorService;
-    APIService: APIService;
+    APIService: IAPIService;
 }
 export class LiveSyncManagers {
     protected _pathService: IPathService;
     protected _replicatorService: IReplicatorService;
     protected _settingService: ISettingService;
-    protected _APIService: APIService;
+    protected _APIService: IAPIService;
 
     hashManager: HashManager;
     chunkFetcher: ChunkFetcher;
@@ -59,6 +59,8 @@ export class LiveSyncManagers {
 
     async teardownManagers() {
         this.log("Teardown LiveSync Managers...", LOG_LEVEL_VERBOSE);
+        this.hashManager?.clearCaches();
+        this.entryManager?.hashManager?.clearCaches();
         if (this.changeManager) {
             this.changeManager.teardown();
             this.changeManager = undefined!;
@@ -77,7 +79,7 @@ export class LiveSyncManagers {
 
     protected getManagerMembers() {
         this.log("Creating LiveSync Managers...");
-        const database = this.options.databaseService.localDatabase.localDatabase;
+        const database = this.options.database;
 
         const changeManager = new ChangeManager<EntryDoc>({
             database,
@@ -95,6 +97,7 @@ export class LiveSyncManagers {
             changeManager: changeManager,
             database,
             settingService: this.options.settingService,
+            finiteReplicationActivity: this.options.replicatorService.finiteReplicationActivityCount,
         });
         const chunkFetcher = new ChunkFetcher({
             chunkManager: chunkManager,
@@ -150,9 +153,13 @@ export class LiveSyncManagers {
 
     clearCaches() {
         this.chunkManager?.clearCaches();
+        this.hashManager?.clearCaches();
+        this.entryManager?.hashManager?.clearCaches();
     }
 
     async prepareHashFunction() {
+        this.hashManager?.clearCaches();
+        this.entryManager?.hashManager?.clearCaches();
         this.hashManager = new HashManager({
             settingService: this.options.settingService,
         });

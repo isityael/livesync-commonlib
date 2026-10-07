@@ -4,12 +4,11 @@
 // For `features`, please implement service, feature, or, serviceFeature for the sake of
 // robust architecture and dependency management. Only put truly core functions here that.
 
-// Do not import `obsidian`, especially, that because this function is used in every platform.
-import type { getLanguage as ObsidianGetLanguage } from "obsidian";
+export type LanguageGetter = () => string;
 
-let _getLanguage: typeof ObsidianGetLanguage = () => "en";
+let _getLanguage: LanguageGetter = () => "en";
 
-export function setGetLanguage(func: typeof ObsidianGetLanguage) {
+export function setGetLanguage(func: LanguageGetter) {
     _getLanguage = func;
 }
 
@@ -29,11 +28,6 @@ export const compatGlobal = (
 export type CompatTimeoutHandle = ReturnType<typeof setTimeout> | number;
 export type CompatIntervalHandle = ReturnType<typeof setInterval> | number;
 
-type CssStyleTarget<T extends Element> = T & {
-    setCssStyles?: (styles: Partial<CSSStyleDeclaration>) => void;
-    setCssProps?: (props: Record<string, string>) => void;
-};
-
 /**
  * A wrapper around the global fetch function to ensure compatibility across different environments.
  * In Obsidian, they recommend using their own requestUrl for better performance and reliability.
@@ -46,75 +40,6 @@ type CssStyleTarget<T extends Element> = T & {
  */
 export const _fetch = compatGlobal.fetch.bind(compatGlobal);
 
-export const _activeDocument = (
-    "activeDocument" in compatGlobal ? compatGlobal.activeDocument : (compatGlobal as typeof window).document
-) as Document | undefined;
-
-// Polyfill HTMLElement and SVGElement with setCssStyles and setCssProps for non-Obsidian environments (e.g. webapp, webpeer)
-if (typeof HTMLElement !== "undefined") {
-    const htmlPrototype = HTMLElement.prototype as CssStyleTarget<HTMLElement>;
-    if (!htmlPrototype.setCssStyles) {
-        htmlPrototype.setCssStyles = function (styles: Partial<CSSStyleDeclaration>) {
-            for (const [key, value] of Object.entries(styles)) {
-                if (value === undefined || value === null) {
-                    this.style.removeProperty(key);
-                    const camelKey = key.replace(/-([a-z])/g, (g) => g[1].toUpperCase());
-                    if (camelKey !== key) {
-                        (this.style as unknown as Record<string, string>)[camelKey] = "";
-                    }
-                } else {
-                    if (key in this.style) {
-                        (this.style as unknown as Record<string, string>)[key] = value as unknown as string;
-                    } else {
-                        this.style.setProperty(key, value as unknown as string);
-                    }
-                }
-            }
-        };
-    }
-    if (!htmlPrototype.setCssProps) {
-        htmlPrototype.setCssProps = function (props: Record<string, string>) {
-            for (const [key, value] of Object.entries(props)) {
-                if (value === undefined || value === null) {
-                    this.style.removeProperty(key);
-                } else {
-                    this.style.setProperty(key, value);
-                }
-            }
-        };
-    }
-}
-
-if (typeof SVGElement !== "undefined") {
-    const svgPrototype = SVGElement.prototype as CssStyleTarget<SVGElement>;
-    if (!svgPrototype.setCssStyles) {
-        svgPrototype.setCssStyles = function (styles: Partial<CSSStyleDeclaration>) {
-            for (const [key, value] of Object.entries(styles)) {
-                if (value === undefined || value === null) {
-                    this.style.removeProperty(key);
-                    const camelKey = key.replace(/-([a-z])/g, (g) => g[1].toUpperCase());
-                    if (camelKey !== key) {
-                        (this.style as unknown as Record<string, string>)[camelKey] = "";
-                    }
-                } else {
-                    if (key in this.style) {
-                        (this.style as unknown as Record<string, string>)[key] = value as unknown as string;
-                    } else {
-                        this.style.setProperty(key, value as unknown as string);
-                    }
-                }
-            }
-        };
-    }
-    if (!svgPrototype.setCssProps) {
-        svgPrototype.setCssProps = function (props: Record<string, string>) {
-            for (const [key, value] of Object.entries(props)) {
-                if (value === undefined || value === null) {
-                    this.style.removeProperty(key);
-                } else {
-                    this.style.setProperty(key, value);
-                }
-            }
-        };
-    }
-}
+type ActiveDocumentWindow = typeof window & { activeDocument?: Document };
+const activeDocumentWindow = compatGlobal as ActiveDocumentWindow;
+export const _activeDocument: Document = activeDocumentWindow.activeDocument ?? activeDocumentWindow.document;

@@ -24,6 +24,7 @@ import {
     type CouchDBConnection,
     type EncryptionSettings,
 } from "./types.ts";
+import { normaliseP2PConnectionPath, normaliseP2PMaxWirePayloadBytes } from "./models/setting.p2p.ts";
 import { isErrorOfMissingDoc } from "@lib/pouchdb/utils_couchdb.ts";
 import { replaceAll, replaceAllPairs } from "octagonal-wheels/string";
 export { replaceAll, replaceAllPairs };
@@ -283,6 +284,22 @@ export const globalConcurrencyController = Semaphore(50);
 export function determineTypeFromBlob(data: Blob): "newnote" | "plain" {
     return isTextBlob(data) ? "plain" : "newnote";
 }
+
+/**
+ * Whether remediation mode is active.
+ *
+ * While a modification-time limit is configured, Commonlib refuses every reconciliation scan
+ * between the storage and the local database and keeps storage events unqueued, so that a state
+ * being recovered is not overwritten by the current one. A host therefore stays unready while the
+ * limit is configured, because readiness depends upon that refused scan. Applying the limit to the
+ * documents which arrive is the responsibility of the host.
+ * @param settings Settings to inspect
+ * @returns `true` when a modification-time limit is configured.
+ */
+export function isRemediationModeActive(settings: Pick<ObsidianLiveSyncSettings, "maxMTimeForReflectEvents">): boolean {
+    return (settings.maxMTimeForReflectEvents ?? 0) > 0;
+}
+
 export function determineType(
     path: string,
     data: string | string[] | Uint8Array | ArrayBuffer | Blob
@@ -595,6 +612,9 @@ export function pickEncryptionSettings(setting: ObsidianLiveSyncSettings | Encry
         encrypt: setting.encrypt,
         passphrase: setting.passphrase,
         usePathObfuscation: setting.usePathObfuscation,
+        encryptInternalMetadata: setting.encryptInternalMetadata,
+        idDerivationVersion: setting.idDerivationVersion,
+        idDerivationKey: setting.idDerivationKey,
     };
 }
 export function pickP2PSyncSettings(setting: Partial<ObsidianLiveSyncSettings> & P2PConnectionInfo): P2PConnectionInfo {
@@ -610,6 +630,11 @@ export function pickP2PSyncSettings(setting: Partial<ObsidianLiveSyncSettings> &
         P2P_turnServers: setting.P2P_turnServers,
         P2P_turnUsername: setting.P2P_turnUsername,
         P2P_turnCredential: setting.P2P_turnCredential,
+        P2P_maxWirePayloadBytes: normaliseP2PMaxWirePayloadBytes(setting.P2P_maxWirePayloadBytes),
+        P2P_connectionPath: normaliseP2PConnectionPath(setting.P2P_connectionPath),
+        P2P_managedType: setting.P2P_managedType,
+        P2P_managedId: setting.P2P_managedId,
+        P2P_managedToken: setting.P2P_managedToken,
     };
 }
 

@@ -30,9 +30,13 @@ export const configurationNames: Partial<Record<keyof ObsidianLiveSyncSettings, 
         name: "Property Encryption",
         desc: "If enabled, the file properties will be encrypted in the remote database. This is useful for protecting sensitive information in file paths, sizes, and IDs of its chunks. If you are using V1 E2EE, this only obfuscates the file path.",
     },
+    encryptInternalMetadata: {
+        name: "Encrypt internal file Properties",
+        desc: "Encrypt file properties (paths, times, sizes, and Chunk references) used by Hidden File Sync and Customisation Sync. This affects future writes; manually rebuild the remote database to protect existing properties. Requires E2EE V2, Property Encryption, and compatible clients on every device.",
+    },
     enableCompression: {
         name: "Data Compression",
-        status: "EXPERIMENTAL",
+        level: LEVEL_ADVANCED,
     },
     useEden: {
         name: "Incubate Chunks in Document",
@@ -75,8 +79,8 @@ export const configurationNames: Partial<Record<keyof ObsidianLiveSyncSettings, 
         desc: "If this enabled, All files are handled as case-Sensitive (Previous behaviour).",
     },
     doNotUseFixedRevisionForChunks: {
-        name: "Compute revisions for chunks (Previous behaviour)",
-        desc: "If this enabled, all chunks will be stored with the revision made from its content. (Previous behaviour)",
+        name: "Content-derived chunk revisions (obsolete setting)",
+        desc: "Chunk revisions are always derived from their content. This stored key is retained only for compatibility.",
     },
     useSegmenter: {
         name: "Use Segmented-splitter",
@@ -165,6 +169,14 @@ export const configurationNames: Partial<Record<keyof ObsidianLiveSyncSettings, 
         name: "TURN Credential",
         desc: "The credential/password for the TURN servers.",
         isHidden: true,
+    },
+    P2P_maxWirePayloadBytes: {
+        name: "P2P Message Size",
+        desc: "The maximum outgoing RPC wire payload before Commonlib splits it for the P2P transport.",
+    },
+    P2P_connectionPath: {
+        name: "Connection Path",
+        desc: "Select the WebRTC route automatically or require a configured TURN relay.",
     },
     useOnlyLocalChunk: {
         name: "Use Only Local Chunks",

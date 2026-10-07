@@ -1,10 +1,11 @@
+import { it } from "vitest";
 import { DIFF_DELETE, DIFF_EQUAL, DIFF_INSERT, diffLinesAsTuples } from "./lineDiff.ts";
 
 function assert(condition: unknown, message: string): asserts condition {
     if (!condition) throw new Error(message);
 }
 
-Deno.test("diffLinesAsTuples preserves equal, delete, and insert tuple shape", () => {
+it("diffLinesAsTuples preserves equal, delete, and insert tuple shape", () => {
     const diff = diffLinesAsTuples("a\nb\n", "a\nc\n");
 
     assert(diff.length === 3, `expected 3 diff pieces, got ${diff.length}`);

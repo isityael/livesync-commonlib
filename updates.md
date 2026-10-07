@@ -1,0 +1,388 @@
+# Updates
+
+## Unreleased
+
+## 0.1.36
+
+4th October, 2026
+
+### Fixed
+
+- Encrypted CouchDB replication can continue after a remote Rebuild retains document revisions.
+    - CouchDB connections bypass browser HTTP caching so earlier ciphertext is not reused after Security Seed replacement.
+
+## 0.1.35
+
+2nd October, 2026
+
+### Fixed
+
+- Harden handling of sensitive values when serialising configuration.
+- Harden JSON patch and merge handling.
+
+## 0.1.34
+
+30th September, 2026
+
+### Added
+
+- We can now distinguish initial and retrying on-demand Chunk reads while retaining a total pending count for lifecycle deferral.
+    - The compatibility stores expose an atomic `chunkFetchCounts` snapshot with `initial` and `retrying` counts. `collectingChunks` continues to count all accepted pending Chunk identifiers.
+
+### Fixed
+
+- On-demand Chunk reads now retry temporary remote omissions before reporting the Chunk as unavailable.
+    - A first successful omission schedules a retry. While finite replication remains active, per-identifier delays increase from two seconds to ten seconds, and physical fetch concurrency is released between attempts.
+    - Finite replication completion interrupts backoff for a local recheck and a final remote probe where needed. A final successful omission then settles the current read.
+    - Pending counts now include queueing and retry delays, without counting duplicate requests or retry attempts as additional identifiers.
+
+### Included from 0.1.32 and 0.1.33 on next
+
+- Optional independent keys let us retain encrypted Chunk IDs and obfuscated Metadata document IDs across E2EE passphrase changes.
+    - Recovery codes, encrypted Setup URIs, and P2P configuration sharing carry the ID configuration. Connections check document ID compatibility before changing remote control documents, and ordinary Tweak alignment preserves local ID settings.
+    - Turning E2EE off retains the saved key while suspending independent ID derivation. Existing configurations without a key keep legacy generation.
+- Independent Chunk ID calculation handles large Chunks more efficiently, and hosts can reuse the shared hash manager through the focused `/hashing` entry.
+    - Chunk calculation applies xxHash64 before HMAC-SHA-256 and reuses a prepared Chunk key. This replaces the independent Chunk calculation introduced in `0.1.32` on `next`; document IDs, agreement proofs, saved settings, and recovery codes retain their existing formats.
+    - Chunk collision resistance remains bounded by the 64-bit prehash. A reused `HashManager` honours the current E2EE setting and releases cached key preparation when E2EE is disabled.
+- Hosts can resume work waiting for application readiness after ordinary initialisation and completed Fetch or Rebuild operations.
+    - `AppLifecycleService.markIsReady()` emits `EVENT_APPLICATION_READY` on the service context's event channel.
+- Setup URIs can use a fixed seven-day UTC window while retaining Persistent URIs compatible with existing readers.
+    - The reader accepts the current window or the original Persistent format and reports a generic opening failure. Expiry does not revoke settings or credentials already imported.
+
+## 0.1.33
+
+29th September, 2026
+
+I was a little concerned about performance, so I have made some adjustments. Please note that releases tagged `next` on npm may be unstable.
+
+### Added
+
+- We can now use the database's Chunk ID calculation through the focused `/hashing` entry, which exports `HashManager` and `HashManagerCoreOptions`.
+
+### Changed
+
+- Generating independent Chunk IDs now processes large Chunks more efficiently by applying xxHash64 before HMAC-SHA-256 and reusing a prepared Chunk key.
+    - This replaces the independent Chunk calculation introduced in `0.1.32` on `next`. Document IDs, agreement proofs, saved settings, and recovery codes retain their existing formats.
+    - Chunk collision resistance is bounded by the 64-bit prehash; the full HMAC output does not increase that limit.
+
+### Fixed
+
+- A reused `HashManager` now honours the current E2EE setting when selecting encrypted or plain Chunk calculation. Turning E2EE off preserves the saved independent key for later reuse and releases its cached preparation.
+
+### Included from 0.1.32 on next
+
+- Optional independent keys for encrypted Chunk IDs and obfuscated Metadata document IDs, with recovery codes and configuration sharing through encrypted Setup URIs and P2P.
+    - The key can be retained across E2EE passphrase changes and suspended while E2EE is off. Existing configurations without a key retain legacy generation.
+    - Connections check document ID compatibility before changing remote control documents, and ordinary Tweak alignment preserves local ID settings.
+- Application readiness events after ordinary initialisation and completed Fetch or Rebuild operations, so hosts can resume work waiting for readiness.
+- Setup URIs for a fixed seven-day UTC window, alongside Persistent URIs compatible with existing readers. The reader accepts the current window or the original Persistent format and reports a generic opening failure. Expiry does not revoke settings or credentials already imported.
+
+## 0.1.32
+
+29th September, 2026
+
+### Added
+
+- `AppLifecycleService.markIsReady()` now emits `EVENT_APPLICATION_READY` on the service context's event channel when it establishes application readiness, after ordinary initialisation and after a fetch or rebuild completes. A host which holds work until the application is ready can continue it then; nothing signalled the transition before, so held work waited for an unrelated event ([Self-hosted LiveSync issue #1200](https://github.com/vrtmrz/obsidian-livesync/issues/1200)).
+- Optional independent ID keys for encrypted Chunk IDs and obfuscated Metadata document IDs. The saved key can be retained when the E2EE passphrase changes.
+- Versioned ID recovery codes allow a saved key to be transferred without deriving it again. Setup URIs and P2P configuration sharing also carry the ID configuration.
+- Setup URIs can now be generated for the current fixed seven-day UTC window. The generator returns the exact end time, and the reader uses the entered passphrase and its current window without storing a time or mode marker in the URI.
+- An explicit Persistent mode keeps the existing encrypted URI format and passphrase, so clients which already read that format can still open it.
+
+### Changed
+
+- Connections check document ID compatibility before updating remote control documents. Incompatible document ID configurations are rejected, and ordinary Tweak alignment preserves the saved ID version and key.
+- Turning E2EE off preserves the saved ID key for later reuse and suspends independent ID derivation. Existing settings and complete imports without an ID configuration retain the legacy format.
+- The Setup URI reader tries both the current Ephemeral window and the original passphrase for encrypted URIs. An unreadable URI has one generic opening failure, whether its passphrase is wrong, its time window differs, or its ciphertext is damaged. This time condition does not revoke settings or credentials already imported.
+
+## 0.1.31
+
+28th September, 2026
+
+### Fixed
+
+- E2EE passphrases beginning with `%` are now encrypted before settings are saved, preventing plain-text storage and loss of the passphrase after a restart in Self-hosted LiveSync ([issue #1221](https://github.com/vrtmrz/obsidian-livesync/issues/1221)).
+    - On an already affected device, re-enter the passphrase used to encrypt its existing data after updating. An existing plain-text value cannot be safely treated as encrypted data.
+
+## 0.1.30
+
+27th September, 2026
+
+### Added
+
+- We can now keep the file properties used by Hidden File Sync and Customisation Sync private in CouchDB.
+    - **Encrypt internal file Properties** extends E2EE V2 and Property Encryption to their paths, times, sizes, and Chunk references.
+    - Existing configurations keep this preference disabled. New Vaults enable it for use when the required encryption settings are active.
+    - Update every synchronising device before enabling it. It protects future writes; a manual remote Rebuild is strongly recommended to protect existing properties.
+- We can now see which unsupported feature prevents a client from synchronising with CouchDB.
+    - Clients check the features recorded by the remote database before transferring data, and report any identifiers they do not recognise.
+
+### Fixed
+
+- Fast Fetch now preserves our local database when the remote requires unsupported features.
+    - Compatibility is checked before resetting the local database, including when resuming an interrupted Fetch.
+- Manual CouchDB Chunk transfers now stop when compatibility checks fail.
+    - Bulk Chunk sending and direct remote Chunk fetching now respect the same rejection as ordinary synchronisation.
+- Differing values for the new encryption preference do not block CouchDB or Object Storage synchronisation when it does not apply.
+    - CouchDB compares this preference only when E2EE V2 and Property Encryption are active. Object Storage excludes it from the comparison.
+
+## 0.1.29
+
+26th September, 2026
+
+### Fixed
+
+- HKDF-encrypted Metadata now decrypts its stored path without treating the encrypted field as a document ID, restoring synchronisation with path obfuscation. The encrypted format and legacy V1 path fallback are unchanged.
+
+## 0.1.28
+
+25th September, 2026
+
+### Fixed
+
+- Equal-time offline scans now record the current revision for an untracked file only when its bytes match the current, conflict-free database content. A later incoming update can then replace the unchanged file without creating a false conflict; existing revision records and genuine local edits retain their conservative conflict handling ([Self-hosted LiveSync issue #1207](https://github.com/vrtmrz/obsidian-livesync/issues/1207)).
+- A fetch now completes while remediation mode is active. The mode refuses every reconciliation scan between the storage and the local database, and both scans a fetch requested were treated as failures, so a fetch started to recover an earlier state stopped after the local database had already been emptied, with reflection left suspended. Both refused scans are now skipped in this mode. Unless the host applies arriving documents itself, the fetched state stays in the local database until the modification-time limit is cleared and an ordinary scan runs ([Self-hosted LiveSync issue #1202](https://github.com/vrtmrz/obsidian-livesync/issues/1202)).
+- Fetching in remediation mode no longer stores the files currently in the storage into the database first. Staging them would publish the state being replaced, and the preparation scan it requires is refused in this mode anyway.
+- Finalising a rebuild in remediation mode persists the resumed reflection settings but no longer marks the application ready, because readiness would claim a scan which the mode refuses. The host stays as restricted as it is during an ordinary start in this mode, so a consumer which applies received documents only once ready needs its own allowance for the mode.
+- Rebuilding is refused while remediation mode is active, before the local database is reset. Rebuilding publishes the current storage as the remote, which is the opposite of restoring an earlier state.
+- Preserve colons within ordinary file names through path normalisation, Metadata ID conversion, file selection, and storage reflection. Only recognised leading path namespaces are stripped; Darwin and Linux filename validation now permits colons, while Windows and Android validation remains unchanged ([Self-hosted LiveSync issue #1206](https://github.com/vrtmrz/obsidian-livesync/issues/1206)).
+
+## 0.1.27
+
+18th September, 2026
+
+### Added
+
+- The `/replication` entry now exports `PROVIDER_OWNED_CENTRAL_REMOTE_REPLICATION_READINESS` for central providers that prepare the Security Seed within each transfer.
+
+### Fixed
+
+- Object Storage Journal transfers now read fresh synchronisation parameters before compatibility checks can write a milestone, then reuse that result for the checkpoint epoch and encrypted files. An unavailable parameter read stops the transfer before remote writes.
+- Journal releases its transfer-scoped parameter cache after every outcome and on configuration or resource reset, without clearing another remote's cached parameters.
+
+## 0.1.26
+
+17th September, 2026
+
+### Fixed
+
+- An unchanged local file is now recognised through its recorded revision, preventing stale content from being saved as a child of a newer database version. Genuine edits extend the recorded revision, including intentional reverts to historical content ([Self-hosted LiveSync issue #994](https://github.com/vrtmrz/obsidian-livesync/issues/994)).
+- Local content with unknown ancestry is preserved as a fresh independent branch unless a current non-deleted leaf already contains the same bytes. Incoming updates use the same checks before replacing unsynchronised content.
+
+### Changed
+
+- File saves and incoming reflection share a lock per document. Renames acquire source and target locks in a consistent order, and conflict callbacks run after locks are released so immediate resolution can safely call the file handler again.
+- Ordinary saves read the file body once after acquiring the document lock and retain that snapshot until the database write completes. Later edits are handled by subsequent operations; startup recovery and incoming overwrite protection retain their rechecks.
+
+## 0.1.25
+
+16th September, 2026
+
+### Added
+
+- Optional `prepareP2PSettings` hook for hosts to supply ICE servers and credential expiry for each P2P room.
+- Host-defined TURN provider settings in existing P2P profiles, Setup URIs, and QR codes.
+
+### Changed
+
+- Keep host-issued ICE credentials in memory and acquire fresh credentials when room reconciliation detects expiry or after explicit reconnection.
+- Require encrypted storage for managed P2P profile credentials.
+- Use digest-pinned RustFS images for managed integration tests.
+
+## 0.1.24
+
+8th September, 2026
+
+### Added
+
+- The `/settings` entry now exports `assessTweakCompatibility`, providing effective setting values, directional adoption changes, and reconstruction requirements for host recovery interfaces.
+
+### Changed
+
+- Central replication treats an absent `handleFilenameCaseSensitive` value as `false`. Explicit `false` versus missing remains compatible; explicit `true` versus missing now rejects replication and requires resolution.
+
+### Fixed
+
+- CouchDB and Object Storage recovery hints now retain the exact compatibility assessment from the failed attempt, allowing hosts to use the same decision when presenting recovery choices ([Self-hosted LiveSync issue #1180](https://github.com/vrtmrz/obsidian-livesync/issues/1180)).
+- Directional replication retries now use the settings saved during recovery while retaining the check against the original active Replicator context.
+
+## 0.1.23
+
+### Fixed
+
+- Watcher deletions are now revalidated against current storage before they can logically delete file Metadata. A stale `DELETE` for a file which remains present under the same canonical document ID, including separate `CREATE` and `DELETE` notifications from an external case-only parent-directory rename, is suppressed; confirmed absence retains the existing deletion behaviour, and storage-inspection failures preserve Metadata. Rename-derived deletions retain their explicit destination semantics, while replicated logical deletions and explicit database deletions remain unchanged ([Self-hosted LiveSync issue #1168](https://github.com/vrtmrz/obsidian-livesync/issues/1168)). This does not add general folder-rename handling or path-case convergence.
+
+## 0.1.22
+
+### Fixed
+
+- An ordinary host start-up may explicitly continue after individual offline-scan file failures without marking those pairs as completed or losing their retry state. Affected paths are logged at verbose level, while recovery and CLI scans retain strict completion by default ([Self-hosted LiveSync issue #1164](https://github.com/vrtmrz/obsidian-livesync/issues/1164)).
+- Database-preparation failures now log their stage at verbose level and leave user-facing notices to the host, while replication reports incomplete application initialisation instead of the bare 'Not ready' diagnostic.
+
+## 0.1.21
+
+### Changed
+
+- User-initiated OneShot requests now choose an explicit `quiet` or `notice` progress presentation independently of interaction authority. `UserInitiatedOneShotRequest.progressPresentation` is required, and `ReplicationFailureRequest.progressPresentation` replaces `showMessage` so failure handling retains the caller's presentation choice.
+
+### Fixed
+
+- OneShot admission is now reserved before the first asynchronous readiness check. Additional user-initiated or unattended requests while an attempt is active settle immediately with `replication-in-progress` instead of queuing another replication after it completes.
+
+## 0.1.20
+
+### Added
+
+- New focused `@vrtmrz/livesync-commonlib/replication` and `@vrtmrz/livesync-commonlib/p2p` package entries expose provider definitions, explicit capability availability, opaque configuration identities, interaction authority, typed replication outcomes, owned finite remote resources, optional central-remote administration, and eight focused P2P service views through package-tested boundaries.
+- A packaged developer guide now explains when to use Service handlers, service features, ServiceModules, private feature contexts, and focused resource owners.
+
+### Changed
+
+- Active Replicator publication is now bound to a provider-owned configuration identity. A changed effective configuration fences new admissions, requests supported transfer cancellation, drains admitted work, closes the previous instance, and only then publishes its replacement. An unchanged identity retains the current instance, and stale asynchronous candidates are discarded.
+- User-initiated, unattended, continuous, and stop operations now have separate capability and interaction contracts. Finite work must report explicit completion, while continuous start retains the legacy permissive `void` settlement only when the provider declares support. `ActiveReplicatorContext.configurationIdentity` is now required, and Replicator termination and closure may settle asynchronously.
+- Replication failure handling now retains the exact failed publication, detached settings, outcome, and interaction authority, preventing a later replacement Replicator from being used to interpret or recover an earlier attempt.
+- P2P now uses one stable service and room-session owner for persistent demand, finite transfers, connection-probe admission, automatic start, replacement, cancellation, and lifecycle reopening. P2P-only participates as a first-class finite Replicator without claiming central-remote milestones or administration.
+- Transitional RPC calls now support abort signals and cancellation-aware handlers. Cancellation is cooperative and does not roll back work which has already settled.
+
+### Fixed
+
+- Journal synchronisation-parameter and milestone reads now distinguish confirmed absence from an unavailable Object Storage backend. Unavailability is propagated and cannot initialise replacement control data or a new Security Seed; stale cached control reads and retired clients are also fenced ([Self-hosted LiveSync issue #1147](https://github.com/vrtmrz/obsidian-livesync/issues/1147)).
+- Failed P2P replication results now preserve a JSON-safe error code, message, and details across RPC instead of losing native `Error` properties as an empty object.
+- Cancelled or partially failed shim replication no longer advances checkpoints beyond an unsettled batch. Missing source revisions and failed bulk writes are reported explicitly.
+
+## 0.1.19
+
+### Fixed
+
+- Reset and rebuild workflows now reset the local database selected by the resulting settings, rather than whichever database wrapper was already active. During a suffix transition, this prevents a database which was not reset from reopening with stale content. Failures stop before rebuilt events, remote resets, or uploads (Self-hosted LiveSync issue #1126).
+- Rejected or incomplete database initialisation no longer leaves either the physical database or the application marked as ready. Vault scanning and completion hooks now form explicit readiness boundaries, and direct file manipulation rejects an unaccepted database initialisation.
+
+### Improved
+
+- Restored storage events are now revalidated against current exact storage paths before replay. Current file contents replace saved observations, stale deletions are suppressed, and rename halves are admitted only when their current path state supports them.
+
+## 0.1.18
+
+### Added
+
+- P2P profiles can now select an outgoing RPC message bound through `P2P_maxWirePayloadBytes`. `P2PMessageSizePresets` provides Standard (15,360 bytes), Reduced (2,048 bytes), Conservative (1,024 bytes), and Maximum compatibility (800 bytes), while omitted or invalid values retain the established Standard behaviour. This gives constrained WebRTC paths a supported alternative to modifying installed package code. Thank you to @andrewschreiber for the detailed diagnosis and reproducible workaround in [issue #97](https://github.com/vrtmrz/livesync-commonlib/issues/97).
+- P2P profiles can select automatic ICE routing or require a configured TURN relay through `P2P_connectionPath`. Relay-only routing is effective only when at least one syntactically valid `turn:` or `turns:` URL is present. P2P connection strings and QR-encoded settings retain both compatibility choices.
+
+### Improved
+
+- A serving P2P transport is now recreated when its effective message bound or connection path changes. Repeated opens with unchanged compatibility settings remain idempotent.
+
+## 0.1.17
+
+### Added
+
+- `storeWithLiveBaseRevision()` conditionally stores content below an exact current revision-tree leaf using PouchDB's ordinary revision check. Maintained hosts can therefore create a successor without force-writing below a stale base, while the existing `storeWithBaseRevision()` operation retains its deliberate force-write behaviour.
+
+## 0.1.16
+
+### Improved
+
+- CouchDB connection handling is now more robust through the flat `OwnedCouchDBConnection` contract. Its idempotent `close()` cancels abort-capable requests before closing PouchDB. If the complete one-shot preflight remains unsettled for 60 seconds on the web-compatible fetch path, an internal safety fuse ends the attempt, releases its shared operation, and closes the temporary connection before a later trigger can try again. This is not a limit on replication duration. The explicitly selected native Request API retains its existing behaviour because that adapter cannot currently honour transport cancellation.
+
+## 0.1.15
+
+### Fixed
+
+- Start-up offline scans are now faster when Path Obfuscation is enabled.
+
+## 0.1.14
+
+### Fixed
+
+- Commonlib now closes the temporary CouchDB connections it creates for finite remote operations, including one-shot replication, Security Seed refreshes, chunk transfer, maintenance operations, and status queries. Continuous replication closes its previous connection before a retry or restart, while caller-provided connections remain under caller ownership. Connection set-up failures also close the partially initialised handle without masking the original connection error (PR #112). Thank you to @apple-ouyang for the contribution!
+
+## 0.1.13
+
+### Fixed
+
+- Generated packages now declare root and subpath TypeScript mappings derived from the same public export inventory. TypeScript's `Node10` module resolution therefore finds the intended declarations instead of treating valid Commonlib imports as unresolved `error` types in downstream tooling.
+- `octagonal-wheels` 0.1.53 is now the minimum dependency, bringing equivalent declaration mappings to its public entries.
+
+## 0.1.12
+
+### Fixed
+
+- Fast Fetch now writes deletion tombstones to the local database without attempting to decrypt them. A tombstone has no encrypted payload, and decryption previously aborted the whole fetch at the first deleted document. New devices could not complete their initial sync on vaults that contain old deletions ([Self-hosted LiveSync issue #1099](https://github.com/vrtmrz/obsidian-livesync/issues/1099); PR #108). Thank you to @KennethLloyd for the contribution!
+- Offline scans now validate each Metadata document against its actual database ID before pairing it with storage. An inconsistent entry is left unchanged and cannot trigger reflection, deletion, or last-seen updates; a separate, consistent entry for the same logical path continues normally. Maintained hosts can inspect the mismatch by actual ID and explicitly repair one unambiguous entry at a time.
+
+## 0.1.11
+
+### Fixed
+
+- Full offline scans now distinguish completed, deliberately skipped, and failed storage/database pairs. Failed database-to-storage reflections no longer record the database mtime as local last-seen evidence, preventing a later `NEWER_WINS` scan from misclassifying a still-missing file as an offline deletion. Actual failures propagate to maintained hosts, while conflict and size-policy skips remain non-fatal ([Self-hosted LiveSync issue #1065](https://github.com/vrtmrz/obsidian-livesync/issues/1065)).
+
+## 0.1.10
+
+### Fixed
+
+- Fast Fetch now falls back to Standard Fetch when the internal Request API is enabled, avoiding a buffered transport which cannot provide the progressive response reading or request cancellation Fast Fetch requires. Standard Fetch also discards obsolete Fast Fetch checkpoints after resetting the local database ([Self-hosted LiveSync issue #1020](https://github.com/vrtmrz/obsidian-livesync/issues/1020)).
+
+## 0.1.9
+
+### Fixed
+
+- Fast Fetch now forwards configured CouchDB custom headers to every changes-feed request, allowing reverse proxies such as Cloudflare Access to authenticate initial setup consistently with ordinary replication (PR #82). Thank you to @nimula for the contribution!
+
+## 0.1.8
+
+### Fixed
+
+- Fast Fetch now uses a one-second idle timeout for each finite CouchDB changes page instead of a heartbeat, allowing CouchDB 3.2 to return its terminator after the currently available rows have been persisted.
+
+## 0.1.7
+
+### Fixed
+
+- Fast Fetch now sizes each finite CouchDB changes page from a one-row status probe, counts the returned result together with `pending`, and resumes from the page's opaque `last_seq` without comparing token representations. Heartbeat-enabled feeds no longer wait for future writes after the currently available rows have been persisted.
+
+## 0.1.6
+
+### Fixed
+
+- Fast Fetch now completes only after the captured CouchDB changes target has been persisted, and resumes transient interruptions from the last durable checkpoint. Decryption, protocol, and local write failures stop without finalising an incomplete local database ([Self-hosted LiveSync issue #1065](https://github.com/vrtmrz/obsidian-livesync/issues/1065)).
+
+## 0.1.5
+
+### Changed
+
+- Remote-preferred synchronisation setting reads now report explicit available, not-configured, unavailable, or unsupported outcomes, so clients can distinguish a remote without saved synchronisation settings from one whose settings could not be read.
+
+## 0.1.4
+
+### Added
+
+- The settings schema now includes controls for allowing operating-system sleep during finite synchronisation operations on every platform or on desktop only. Setup URIs preserve both preferences.
+
+## 0.1.3
+
+### Fixed
+
+- Remote-only connection and configuration checks no longer access the local database while constructing a replicator, preventing start-up failures before local database initialisation ([Self-hosted LiveSync issue #1064](https://github.com/vrtmrz/obsidian-livesync/issues/1064)).
+
+## 0.1.2
+
+### Fixed
+
+- Unnecessary missing-content warnings are now suppressed when a local file already matches known synchronised history; the existence check stops at the first exact content match instead of reading older revisions which cannot change its result.
+- Remote chunk fetching now keeps successfully returned chunks when another requested chunk is unavailable, preventing the latter from making the whole request appear to have failed ([Self-hosted LiveSync issue #771](https://github.com/vrtmrz/obsidian-livesync/issues/771)).
+
+## 0.1.1
+
+### Improved
+
+- `DirectFileManipulator` can receive a host fetch implementation for direct CouchDB access in runtimes such as Deno.
+- Direct file manipulation now avoids application-owned replication and key-value database lifecycle work.
+
+### Fixed
+
+- `DirectFileManipulator` now yields metadata-only enumeration results, restores its dedicated path-obfuscation passphrase, and contains document loading failures observed while watching changes (PR #22). Thank you to @es617 for the fixes!
+- `DirectFileManipulator` now reports initialisation failures through its readiness promise, and headless logging and manager construction use the capabilities supplied by their composition. This also addresses the start-up failures independently identified in PR #50. Thank you to @adriy-be for the diagnosis and proposed fixes!
+
+### Deprecated
+
+- `SvelteDialogMixIn` remains available for compatibility, but maintained hosts should compose their dialogue lifecycle explicitly.

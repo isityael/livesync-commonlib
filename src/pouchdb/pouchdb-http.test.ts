@@ -1,3 +1,4 @@
+import { it } from "vitest";
 import { PouchDB } from "./pouchdb-http.ts";
 
 function assert(condition: unknown, message: string): asserts condition {
@@ -11,7 +12,7 @@ function jsonResponse(body: unknown, status = 200): Response {
     });
 }
 
-Deno.test("PouchDB HTTP facade maps document, bulk, find, changes, transforms, and auth", async () => {
+it("PouchDB HTTP facade maps document, bulk, find, changes, transforms, and auth", async () => {
     const calls: Array<{ method: string; path: string; body?: any; auth?: string | null }> = [];
     const originalFetch = globalThis.fetch;
 
@@ -87,11 +88,9 @@ Deno.test("PouchDB HTTP facade maps document, bulk, find, changes, transforms, a
         assert(found.docs[0].data === "out:stored", "expected outgoing transform on find");
 
         let changeSeen = false;
-        const changes = await db
-            .changes({ include_docs: true, since: "0" })
-            .on("change", (change) => {
-                changeSeen = change.doc.data === "out:stored";
-            });
+        const changes = await db.changes({ include_docs: true, since: "0" }).on("change", (change) => {
+            changeSeen = change.doc.data === "out:stored";
+        });
         assert(changeSeen, "expected change event with transformed doc");
         assert(changes.last_seq === "2", "expected changes last_seq");
 
@@ -102,7 +101,7 @@ Deno.test("PouchDB HTTP facade maps document, bulk, find, changes, transforms, a
     }
 });
 
-Deno.test("PouchDB HTTP facade normalizes CouchDB errors", async () => {
+it("PouchDB HTTP facade normalizes CouchDB errors", async () => {
     const originalFetch = globalThis.fetch;
     globalThis.fetch = () => Promise.resolve(jsonResponse({ error: "not_found", reason: "missing" }, 404));
     try {
@@ -119,30 +118,40 @@ Deno.test("PouchDB HTTP facade normalizes CouchDB errors", async () => {
     }
 });
 
-Deno.test("PouchDB HTTP facade gives per-document conflicts a 409 status", async () => {
+it("PouchDB HTTP facade gives per-document conflicts a 409 status", async () => {
     const originalFetch = globalThis.fetch;
-    globalThis.fetch = () => Promise.resolve(jsonResponse([
-        { id: "existing", error: "conflict", reason: "Document update conflict." },
-        { id: "broken", error: "forbidden", reason: "write denied" },
-    ], 201));
+    globalThis.fetch = () =>
+        Promise.resolve(
+            jsonResponse(
+                [
+                    { id: "existing", error: "conflict", reason: "Document update conflict." },
+                    { id: "broken", error: "forbidden", reason: "write denied" },
+                ],
+                201
+            )
+        );
     try {
         const db = new PouchDB("https://couch.example/vault");
         const results = await db.bulkDocs([{ _id: "existing" }, { _id: "broken" }]);
         assert(results[0].status === 409, "expected conflict status 409");
-        assert(results[0].id === "existing" && results[0].reason === "Document update conflict.", "expected conflict details");
+        assert(
+            results[0].id === "existing" && results[0].reason === "Document update conflict.",
+            "expected conflict details"
+        );
         assert(results[1].status === undefined, "unknown errors must remain failures");
     } finally {
         globalThis.fetch = originalFetch;
     }
 });
 
-Deno.test("PouchDB HTTP facade encodes slashes in ordinary document IDs", async () => {
+it("PouchDB HTTP facade encodes slashes in ordinary document IDs", async () => {
     const originalFetch = globalThis.fetch;
     const paths: string[] = [];
     globalThis.fetch = (input, init = {}) => {
         const url = new URL(input instanceof Request ? input.url : String(input));
         paths.push(url.pathname);
-        if (init.method === "PUT") return Promise.resolve(jsonResponse({ ok: true, id: "folder/note.md", rev: "2-ok" }, 201));
+        if (init.method === "PUT")
+            return Promise.resolve(jsonResponse({ ok: true, id: "folder/note.md", rev: "2-ok" }, 201));
         return Promise.resolve(jsonResponse({ _id: "folder/note.md", _rev: "1-old" }));
     };
     try {
@@ -151,14 +160,17 @@ Deno.test("PouchDB HTTP facade encodes slashes in ordinary document IDs", async 
         await db.put({ _id: "folder/note.md", _rev: old._rev });
         await db.get("_local/checkpoint");
         assert(paths.length === 3, "expected two GETs and a PUT");
-        assert(paths.slice(0, 2).every((path) => path === "/vault/folder%2Fnote.md"), "ordinary document slashes must be encoded");
+        assert(
+            paths.slice(0, 2).every((path) => path === "/vault/folder%2Fnote.md"),
+            "ordinary document slashes must be encoded"
+        );
         assert(paths[2] === "/vault/_local/checkpoint", "reserved local document routing must be preserved");
     } finally {
         globalThis.fetch = originalFetch;
     }
 });
 
-Deno.test("PouchDB live changes normalizes an empty since checkpoint", async () => {
+it("PouchDB live changes normalizes an empty since checkpoint", async () => {
     const originalFetch = globalThis.fetch;
     let requestedSince: string | null = null;
     let changes: ReturnType<PouchDB["changes"]>;

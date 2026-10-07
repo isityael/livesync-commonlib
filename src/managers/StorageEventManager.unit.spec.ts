@@ -446,14 +446,26 @@ describe("StorageEventManagerBase", () => {
     });
 
     describe("Event Handlers - Rename", () => {
-        it("should handle file rename event", async () => {
+        it("should enqueue a file rename as one event", async () => {
             const file = createMockFile("renamed.md", "renamed.md");
             const oldPath = "old.md";
+            const enqueueSpy = vi.spyOn(manager, "enqueue");
             manager.testWatchVaultRename(file, oldPath);
             // Wait for async appendQueue
-            await new Promise((resolve) => setTimeout(resolve, 10));
-            // Event should trigger onStorageFileEvent
+            await new Promise((resolve) => setTimeout(resolve, 30));
+
             expect(dependencies.fileProcessing.onStorageFileEvent).toHaveBeenCalled();
+            expect(enqueueSpy).toHaveBeenCalledTimes(1);
+            expect(enqueueSpy).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    type: "RENAME",
+                    args: expect.objectContaining({
+                        oldPath,
+                        file: expect.objectContaining({ path: "renamed.md" }),
+                    }),
+                    skipBatchWait: true,
+                })
+            );
         });
 
         it("should handle folder rename event", () => {
@@ -570,6 +582,125 @@ describe("StorageEventManagerBase", () => {
     });
 
     describe("Snapshot Restore", () => {
+        it("should wait for restored event processing to finish", async () => {
+            let releaseProcessing!: (result: boolean) => void;
+            const processing = new Promise<boolean>((resolve) => {
+                releaseProcessing = resolve;
+            });
+            vi.mocked(dependencies.fileProcessing.processFileEvent).mockReturnValue(processing);
+
+            const restoredEvent: FileEventItem = {
+                type: "CHANGED",
+                key: "restored-key",
+                args: {
+                    file: adapter.converter.toFileInfo(createMockFile("restored.md", "restored.md")),
+                },
+            };
+            await adapter.persistence.saveSnapshot([restoredEvent]);
+
+            let restorationSettled = false;
+            const restoration = manager.restoreState().then(() => {
+                restorationSettled = true;
+            });
+
+            try {
+                await vi.waitFor(() => {
+                    expect(dependencies.fileProcessing.processFileEvent).toHaveBeenCalledTimes(1);
+                });
+                expect(dependencies.fileProcessing.processFileEvent).toHaveBeenCalledWith(
+                    expect.objectContaining({ restoredFromPreviousRuntime: true })
+                );
+                await Promise.resolve();
+                expect(restorationSettled).toBe(false);
+            } finally {
+                releaseProcessing(true);
+                await restoration;
+            }
+
+            expect(restorationSettled).toBe(true);
+        });
+
+        it("should preserve sentinel ordering while restoring events", async () => {
+            let releaseFirst!: (result: boolean) => void;
+            const firstProcessing = new Promise<boolean>((resolve) => {
+                releaseFirst = resolve;
+            });
+            const processingOrder: string[] = [];
+            vi.mocked(dependencies.fileProcessing.processFileEvent).mockImplementation(async (event) => {
+                const path = event.args.file.path;
+                processingOrder.push(`${path}:start`);
+                if (path === "first.md") {
+                    await firstProcessing;
+                }
+                processingOrder.push(`${path}:end`);
+                return true;
+            });
+
+            const firstEvent: FileEventItem = {
+                type: "CHANGED",
+                key: "first-key",
+                args: {
+                    file: adapter.converter.toFileInfo(createMockFile("first.md", "first.md")),
+                },
+            };
+            const sentinel: FileEventItemSentinel = { type: "SENTINEL_FLUSH" };
+            const secondEvent: FileEventItem = {
+                type: "CHANGED",
+                key: "second-key",
+                args: {
+                    file: adapter.converter.toFileInfo(createMockFile("second.md", "second.md")),
+                },
+            };
+            await adapter.persistence.saveSnapshot([firstEvent, sentinel, secondEvent]);
+
+            const restoration = manager.restoreState();
+            try {
+                await vi.waitFor(() => {
+                    expect(processingOrder).toContain("first.md:start");
+                });
+                await Promise.resolve();
+                expect(processingOrder).not.toContain("second.md:start");
+            } finally {
+                releaseFirst(true);
+                await restoration;
+            }
+
+            expect(processingOrder).toEqual(["first.md:start", "first.md:end", "second.md:start", "second.md:end"]);
+        });
+
+        it("should continue restoration after an operation fails so the full scan can reconcile", async () => {
+            const processingOrder: string[] = [];
+            vi.mocked(dependencies.fileProcessing.processFileEvent).mockImplementation(async (event) => {
+                const path = event.args.file.path;
+                processingOrder.push(path);
+                if (path === "failed.md") {
+                    throw new Error("restored operation failed");
+                }
+                return true;
+            });
+
+            const failedEvent: FileEventItem = {
+                type: "CHANGED",
+                key: "failed-key",
+                args: {
+                    file: adapter.converter.toFileInfo(createMockFile("failed.md", "failed.md")),
+                },
+            };
+            const sentinel: FileEventItemSentinel = { type: "SENTINEL_FLUSH" };
+            const followingEvent: FileEventItem = {
+                type: "CHANGED",
+                key: "following-key",
+                args: {
+                    file: adapter.converter.toFileInfo(createMockFile("following.md", "following.md")),
+                },
+            };
+            await adapter.persistence.saveSnapshot([failedEvent, sentinel, followingEvent]);
+
+            await expect(manager.restoreState()).resolves.toBeUndefined();
+
+            expect(processingOrder).toEqual(["failed.md", "following.md"]);
+        });
+
         it("should restore state from snapshot", async () => {
             const mockSnapshot: FileEventItem[] = [
                 {
@@ -645,6 +776,15 @@ describe("StorageEventManagerBase", () => {
             expect(enqueueSpy).not.toHaveBeenCalled();
         });
 
+        it("should skip hidden files before target filtering when internal file sync is disabled", async () => {
+            const enqueueSpy = vi.spyOn(manager, "enqueue");
+            const file = createMockFile(".git/objects/aa/example", "example");
+            await manager.testAppendQueue([{ type: "CREATE", file: adapter.converter.toFileInfo(file) }]);
+
+            expect(dependencies.vaultService.isTargetFile).not.toHaveBeenCalled();
+            expect(enqueueSpy).not.toHaveBeenCalled();
+        });
+
         it("should skip recently touched files on CREATE", async () => {
             vi.mocked(dependencies.storageAccessManager.recentlyTouched).mockReturnValue(true);
             const enqueueSpy = vi.spyOn(manager, "enqueue");
@@ -672,6 +812,49 @@ describe("StorageEventManagerBase", () => {
             expect(enqueueSpy).not.toHaveBeenCalled();
         });
 
+        it("should turn a rename out of the target set into a delete", async () => {
+            vi.mocked(dependencies.vaultService.isTargetFile).mockImplementation(async (path) => path === "old.md");
+            const enqueueSpy = vi.spyOn(manager, "enqueue");
+            const file = createMockFile("excluded.txt", "excluded.txt");
+
+            await manager.testAppendQueue([
+                { type: "RENAME", file: adapter.converter.toFileInfo(file), oldPath: "old.md" },
+            ]);
+
+            expect(enqueueSpy).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    type: "DELETE",
+                    args: expect.objectContaining({
+                        oldPath: undefined,
+                        renameTarget: "excluded.txt",
+                        file: expect.objectContaining({ path: "old.md", deleted: true }),
+                    }),
+                })
+            );
+        });
+
+        it("should turn a rename into the target set into a create", async () => {
+            vi.mocked(dependencies.vaultService.isTargetFile).mockImplementation(
+                async (path) => path === "included.md"
+            );
+            const enqueueSpy = vi.spyOn(manager, "enqueue");
+            const file = createMockFile("included.md", "included.md");
+
+            await manager.testAppendQueue([
+                { type: "RENAME", file: adapter.converter.toFileInfo(file), oldPath: "excluded.txt" },
+            ]);
+
+            expect(enqueueSpy).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    type: "CREATE",
+                    args: expect.objectContaining({
+                        oldPath: undefined,
+                        file: expect.objectContaining({ path: "included.md" }),
+                    }),
+                })
+            );
+        });
+
         it("should handle DELETE events", async () => {
             const file = createMockFile("delete.md", "delete.md");
             const enqueueSpy = vi.spyOn(manager, "enqueue");
@@ -690,6 +873,7 @@ describe("StorageEventManagerBase", () => {
 
             expect(dependencies.fileProcessing.onStorageFileEvent).toHaveBeenCalled();
             expect(enqueueSpy).toHaveBeenCalled();
+            expect(enqueueSpy.mock.calls[0]?.[0].args.renameTarget).toBeUndefined();
         });
 
         it("should use cached data when provided", async () => {
@@ -767,7 +951,24 @@ describe("StorageEventManagerBase", () => {
             expect(buffered.some((item) => item.type === "SENTINEL_FLUSH")).toBe(true);
         });
 
-        it("should not add sentinel for non-DELETE events", () => {
+        it("should enqueue items and add sentinel for RENAME", () => {
+            const file = createMockFile("renamed.md", "renamed.md");
+            const item: FileEventItem = {
+                type: "RENAME",
+                args: {
+                    file: adapter.converter.toFileInfo(file),
+                    oldPath: "old.md",
+                },
+                key: "test-key",
+            };
+
+            manager["enqueue"](item);
+
+            const buffered = manager["bufferedQueuedItems"];
+            expect(buffered.some((item) => item.type === "SENTINEL_FLUSH")).toBe(true);
+        });
+
+        it("should not add sentinel for non-destructive events", () => {
             const file = createMockFile("test.md", "test.md");
             const item: FileEventItem = {
                 type: "CREATE",
@@ -1574,6 +1775,40 @@ describe("StorageEventManagerBase", () => {
 
             expect(dependencies.fileProcessing.processFileEvent).toHaveBeenCalledTimes(2);
         }, 10000);
+
+        it("resumes an unrelated file after hot-file waiters release the processing slots", async () => {
+            let releaseHotFile!: () => void;
+            const hotGate = new Promise<void>((resolve) => { releaseHotFile = resolve; });
+            const process = vi.mocked(dependencies.fileProcessing.processFileEvent);
+            process.mockImplementation(async (item) => {
+                if (item.args.file.path === "hot-queue.md") await hotGate;
+                return true;
+            });
+            const event = (path: string, index: number): FileEventItem => ({
+                type: "CHANGED",
+                args: { file: adapter.converter.toFileInfo(createMockFile(path, path)) },
+                key: `queue-${index}`,
+                skipBatchWait: true,
+            });
+            const hot = Array.from({ length: 5 }, (_, index) =>
+                manager.processFileEvent(event("hot-queue.md", index))
+            );
+            const unrelated = manager.processFileEvent(event("unrelated-queue.md", 5));
+            try {
+                // The host counts lock waiters against its existing global limit.
+                // This records the limitation separately from per-document locking.
+                await vi.waitFor(() => {
+                    expect(manager["concurrentProcessing"].waiting).toBe(1);
+                    expect(process).toHaveBeenCalledTimes(1);
+                });
+                expect(process.mock.calls[0][0].args.file.path).toBe("hot-queue.md");
+            } finally {
+                releaseHotFile();
+                await Promise.all([...hot, unrelated]);
+            }
+            expect(process).toHaveBeenCalledTimes(6);
+            expect(process.mock.calls.some(([item]) => item.args.file.path === "unrelated-queue.md")).toBe(true);
+        });
 
         it("should properly release semaphore even when processing fails", async () => {
             vi.mocked(dependencies.fileProcessing.processFileEvent).mockRejectedValueOnce(

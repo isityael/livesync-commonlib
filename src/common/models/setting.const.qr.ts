@@ -56,6 +56,8 @@ export const KeyIndexOfSettings: Record<keyof ObsidianLiveSyncSettings, number> 
     syncOnFileOpen: 52,
     syncOnEditorSave: 53,
     keepReplicationActiveInBackground: -1, // Desktop-only local preference; do not encode into the QR Code.
+    allowSleepDuringSynchronisation: 161,
+    allowSleepDuringSynchronisationOnDesktop: 162,
     syncMinimumInterval: 54,
     showVerboseLog: 55,
     lessInformationInLog: 56,
@@ -158,6 +160,11 @@ export const KeyIndexOfSettings: Record<keyof ObsidianLiveSyncSettings, number> 
     P2P_turnServers: 150,
     P2P_turnUsername: 151,
     P2P_turnCredential: 152,
+    P2P_managedType: -1,
+    P2P_managedId: -1,
+    P2P_managedToken: -1,
+    P2P_iceServers: -1,
+    P2P_iceServersExpiresAt: -1,
     syncInternalFileOverwritePatterns: 153,
     useOnlyLocalChunk: 154,
     maxMTimeForReflectEvents: 155,
@@ -168,4 +175,10 @@ export const KeyIndexOfSettings: Record<keyof ObsidianLiveSyncSettings, number> 
     autoAcceptCompatibleTweak: 160,
     tweakModified: -1,
     P2P_useDiagRTC: -1, // Do not encode into the QR Code.
+    P2P_maxWirePayloadBytes: 163,
+    P2P_connectionPath: 164,
+    encryptInternalMetadata: 165,
+    idDerivationVersion: 166,
+    idDerivationKey: 167,
+    encryptedIdDerivationKey: -1,
 } as const;

@@ -1,3 +1,4 @@
+import { EVENT_APPLICATION_READY } from "@lib/events/coreEvents";
 import { handlers } from "@lib/services/lib/HandlerUtils";
 import type { IAppLifecycleService, ISettingService } from "./IService";
 import { ServiceBase, type ServiceContext } from "./ServiceBase";
@@ -85,6 +86,9 @@ export abstract class AppLifecycleService<T extends ServiceContext = ServiceCont
 
     /**
      * Event triggered when the plug-in is being unloaded.
+     *
+     * Resource owners complete terminal retirement here. `ControlService`
+     * awaits every handler before it closes the local database.
      */
     readonly onUnload = handlers<IAppLifecycleService>().all("onUnload");
     /**
@@ -108,6 +112,7 @@ export abstract class AppLifecycleService<T extends ServiceContext = ServiceCont
 
     /**
      * Event triggered when the application is being suspended (e.g., system sleep).
+     * Suspension is reversible and is not equivalent to terminal unload.
      */
     readonly onSuspending = handlers<IAppLifecycleService>().bailFirstFailure("onSuspending");
 
@@ -152,9 +157,13 @@ export abstract class AppLifecycleService<T extends ServiceContext = ServiceCont
 
     /**
      * Mark the plug-in as ready.
+     * Establishing readiness emits `EVENT_APPLICATION_READY` on the context's event channel, so a host can
+     * continue work it held while the plug-in was not ready. Marking a plug-in which is already ready emits nothing.
      */
     markIsReady(): void {
+        if (this._isReady) return;
         this._isReady = true;
+        this.context.events.emitEvent(EVENT_APPLICATION_READY);
     }
 
     /**

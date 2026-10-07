@@ -6,11 +6,14 @@ import type {
     MODE_PAUSED,
     MODE_SELECTIVE,
     MODE_SHINY,
+    P2PConnectionPath,
     RemoteTypes,
 } from "./setting.const";
-import type { I18N_LANGS } from "@lib/common/rosetta";
 import type { CustomRegExpSourceList } from "./shared.type.util";
 import type { JWTAlgorithm } from "./auth.type";
+
+/** Display languages recognised by the current LiveSync settings schema. */
+export type I18N_LANGS = "" | "def" | "de" | "es" | "fr" | "he" | "ja" | "ko" | "ru" | "zh" | "zh-tw";
 
 /**
  * Represents the connection details required to connect to a CouchDB instance.
@@ -86,6 +89,9 @@ interface EncryptedUserSettings {
      */
     encryptedPassphrase: string;
 
+    /** Encrypted copy of the independent ID key in local persisted settings. */
+    encryptedIdDerivationKey: string;
+
     /**
      * The encrypted connection details for CouchDB.
      */
@@ -126,6 +132,19 @@ interface SyncMethodSettings {
      * and Periodic). Ignored on mobile. Default false.
      */
     keepReplicationActiveInBackground: boolean;
+
+    /**
+     * Allow the operating system to sleep during finite synchronisation operations on every platform.
+     * Default false.
+     */
+    allowSleepDuringSynchronisation: boolean;
+
+    /**
+     * Desktop-only override which allows the operating system to sleep during finite
+     * synchronisation operations when the general preference is disabled. Ignored on mobile.
+     * Default true.
+     */
+    allowSleepDuringSynchronisationOnDesktop: boolean;
 
     /**
      * The minimum delay between synchronisation operations (in milliseconds).
@@ -544,6 +563,7 @@ export enum AutoAccepting {
     NONE = 0,
     ALL = 1,
 }
+
 export interface P2PConnectionInfo {
     /**
      * Indicates whether P2P connection is enabled.
@@ -602,6 +622,27 @@ export interface P2PConnectionInfo {
      */
     P2P_turnCredential: string;
 
+    /** Host-defined managed TURN provider type. */
+    P2P_managedType?: string;
+
+    /** Host-defined managed TURN provider identifier. */
+    P2P_managedId?: string;
+
+    /** Host-defined managed TURN provider token. */
+    P2P_managedToken?: string;
+
+    /**
+     * Maximum serialised RPC wire payload sent through Trystero before
+     * Commonlib splits it. Applies to outgoing messages.
+     */
+    P2P_maxWirePayloadBytes?: number;
+
+    /**
+     * ICE route policy for this P2P profile. Relay-only mode is effective only
+     * when the profile contains at least one valid TURN URL.
+     */
+    P2P_connectionPath?: P2PConnectionPath;
+
     /**
      * Use Diagnostic Wrapper for RTCPeerConnection to collect statistics.
      */
@@ -617,6 +658,12 @@ export interface P2PSyncSetting extends P2PConnectionInfo {
     P2P_AutoDenyingPeers: string;
 
     P2P_IsHeadless?: boolean;
+
+    /** ICE servers prepared for one room connection. Never persist or share this value. */
+    P2P_iceServers?: readonly RTCIceServer[];
+
+    /** Absolute Unix timestamp in milliseconds for the prepared ICE servers. */
+    P2P_iceServersExpiresAt?: number;
 }
 
 /**
@@ -645,11 +692,20 @@ export interface EncryptionSettings {
      */
     passphrase: string;
 
+    /** Zero preserves the historical passphrase-derived ID scheme. */
+    idDerivationVersion: 0 | 1;
+
+    /** A 256-bit key encoded as lower-case hex; never the source string. */
+    idDerivationKey: string;
+
     /**
      * Indicates whether path obfuscation is used.
      * If not, the path will be stored as it is, as the document ID.
      */
     usePathObfuscation: boolean;
+
+    /** Encrypt the Metadata of obfuscated internal files and Customisation Sync entries. */
+    encryptInternalMetadata: boolean;
 
     /**
      * The algorithm used for hashing the passphrase.
@@ -701,7 +757,10 @@ interface ChunkSettings {
     enableChunkSplitterV2: boolean;
 
     /**
-     * Flag indicating whether to avoid using a fixed revision for chunks.
+     * Retained for stored-setting and Setup URI compatibility. Chunk revisions
+     * are always derived from their content, irrespective of this value.
+     *
+     * @deprecated This behaviour is no longer configurable.
      */
     doNotUseFixedRevisionForChunks: boolean;
 
@@ -791,12 +850,14 @@ interface ObsoleteRemoteDBSettings {
     disableRequestURI: boolean;
 
     /**
-     * Indicates whether to send data in bulk chunks.
+     * Retained for settings and Setup URI compatibility.
+     * Automatic bulk chunk pre-send is no longer supported.
+     * @deprecated
      */
     sendChunksBulk: boolean;
 
     /**
-     * The maximum size of the bulk chunks to be sent.
+     * The maximum request size used by the explicit manual chunk resend tool, in MB.
      */
     sendChunksBulkMaxSize: number;
 

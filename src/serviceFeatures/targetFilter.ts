@@ -5,6 +5,7 @@ import { isAcceptedAll } from "@lib/string_and_binary/path";
 import { Computed } from "octagonal-wheels/dataobject/Computed";
 
 import type { NecessaryServices } from "@lib/interfaces/ServiceModule";
+import type { IVaultService } from "@lib/services/base/IService";
 import { promiseWithResolvers } from "octagonal-wheels/promises";
 
 /**
@@ -49,7 +50,11 @@ export function isAcceptedInFilenameDuplicationFactory(
         },
     });
 
-    return async function isAcceptedInFilenameDuplication(file: string | UXFileInfoStub): Promise<boolean> {
+    return async function isAcceptedInFilenameDuplication(
+        file: string | UXFileInfoStub,
+        options?: Parameters<IVaultService["isTargetFile"]>[1]
+    ): Promise<boolean> {
+        if (options?.skipCaseCollisionCheck) return true;
         const fileCountMap = (
             await fileCountMapComputed.update(host.services.fileProcessing.totalStorageFileEventCount)
         ).value;
@@ -186,7 +191,7 @@ export function useTargetFilters(
     // 1. Duplication Check
     const _isAcceptedFilenameDuplication = isAcceptedInFilenameDuplicationFactory(
         {
-            services: { vault: services.vault, fileProcessing: services.fileProcessing },
+            services: { context: services.context, vault: services.vault, fileProcessing: services.fileProcessing },
             serviceModules: { storageAccess: serviceModules.storageAccess },
         },
         logger
@@ -195,7 +200,7 @@ export function useTargetFilters(
     // 2. Ignore File Check
     const _isAcceptedByIgnoreFiles = isAcceptedByIgnoreFilesFactory(
         {
-            services: { setting: services.setting, appLifecycle: services.appLifecycle },
+            services: { context: services.context, setting: services.setting, appLifecycle: services.appLifecycle },
             serviceModules: { storageAccess: serviceModules.storageAccess },
         },
         logger
@@ -204,7 +209,7 @@ export function useTargetFilters(
     // 3. Local DB Check
     const _isAcceptedByLocalDB = isAcceptedByLocalDBFactory(
         {
-            services: { database: services.database, databaseEvents: services.databaseEvents },
+            services: { context: services.context, database: services.database, databaseEvents: services.databaseEvents },
             serviceModules: {},
         },
         logger
@@ -213,7 +218,7 @@ export function useTargetFilters(
     // 4. Final Check
     const _isAcceptedAlways = isAcceptedAlwaysFactory(
         {
-            services: {},
+            services: { context: services.context },
             serviceModules: {},
         },
         logger

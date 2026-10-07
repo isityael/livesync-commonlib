@@ -106,14 +106,41 @@ import {
     MODE_PAUSED,
     MODE_SELECTIVE,
     MODE_SHINY,
+    P2PConnectionPaths,
+    P2PMessageSizePresets,
+    type P2PConnectionPath,
 } from "./models/setting.const.ts";
+import {
+    hasManagedP2PTurnConfiguration,
+    hasP2PTurnConfiguration,
+    hasValidP2PTurnServerUrl,
+    omitP2PRuntimeSettings,
+    isValidP2PTurnServerUrl,
+    normaliseP2PConnectionPath,
+    normaliseP2PMaxWirePayloadBytes,
+    splitP2PTurnServerUrls,
+} from "./models/setting.p2p.ts";
 import {
     PREFERRED_BASE,
     PREFERRED_JOURNAL_SYNC,
     PREFERRED_SETTING_CLOUDANT,
     PREFERRED_SETTING_SELF_HOSTED,
 } from "./models/setting.const.preferred.ts";
-import { P2P_DEFAULT_SETTINGS, DEFAULT_SETTINGS } from "./models/setting.const.defaults.ts";
+import {
+    P2P_DEFAULT_SETTINGS,
+    DEFAULT_SETTINGS,
+    NEW_VAULT_SETTINGS,
+    SETTINGS_SCHEMA_DEFAULTS,
+    createNewVaultSettings,
+} from "./models/setting.const.defaults.ts";
+import {
+    prepareSettingsForLoad,
+    SettingsMigrationReviewCodes,
+    type PreparedSettings,
+    type SettingsMigrationReviewCode,
+    type SettingsMigrationReviewReason,
+    type SettingsMigrationState,
+} from "./models/setting.lifecycle.ts";
 import { KeyIndexOfSettings } from "./models/setting.const.qr.ts";
 import type {
     DeviceInfo,
@@ -190,7 +217,21 @@ import {
     TweakValuesTemplate,
     type TweakValues,
     DEVICE_ID_PREFERRED,
+    RemotePreferredTweakStatuses,
+    type RemotePreferredTweakStatus,
+    RemotePreferredTweakNotConfiguredReasons,
+    type RemotePreferredTweakNotConfiguredReason,
+    type RemotePreferredTweakResult,
 } from "./models/tweak.definition.ts";
+import type {
+    TweakAssessment,
+    TweakAssessmentEntry,
+    TweakAssessmentRelation,
+    TweakAssessmentValue,
+    TweakTransition,
+    TweakTransitionReason,
+} from "./models/tweak.compatibility.ts";
+import type { TweakReconstruction } from "./models/tweak.definition.ts";
 import type {
     diff_result_leaf,
     dmp_result,
@@ -246,8 +287,27 @@ export { type PluginSyncSettingEntry };
 export { SETTING_VERSION_INITIAL, SETTING_VERSION_SUPPORT_CASE_INSENSITIVE, CURRENT_SETTING_VERSION };
 export type { BucketSyncSetting, LocalDBSettings };
 
-export { RemoteTypes, REMOTE_COUCHDB, REMOTE_MINIO, REMOTE_P2P, type RemoteType, AutoAccepting };
-export type { P2PConnectionInfo, P2PSyncSetting };
+export {
+    RemoteTypes,
+    REMOTE_COUCHDB,
+    REMOTE_MINIO,
+    REMOTE_P2P,
+    P2PConnectionPaths,
+    P2PMessageSizePresets,
+    type RemoteType,
+    AutoAccepting,
+};
+export type { P2PConnectionInfo, P2PConnectionPath, P2PSyncSetting };
+export {
+    hasManagedP2PTurnConfiguration,
+    hasP2PTurnConfiguration,
+    hasValidP2PTurnServerUrl,
+    omitP2PRuntimeSettings,
+    isValidP2PTurnServerUrl,
+    normaliseP2PConnectionPath,
+    normaliseP2PMaxWirePayloadBytes,
+    splitP2PTurnServerUrls,
+};
 
 export { P2P_DEFAULT_SETTINGS };
 
@@ -260,7 +320,15 @@ export { HashAlgorithms, type HashAlgorithm, ChunkAlgorithmNames, ChunkAlgorithm
 export type { RemoteDBSettings };
 export type { ObsidianLiveSyncSettings };
 
-export { DEFAULT_SETTINGS };
+export { DEFAULT_SETTINGS, NEW_VAULT_SETTINGS, SETTINGS_SCHEMA_DEFAULTS, createNewVaultSettings };
+export {
+    prepareSettingsForLoad,
+    SettingsMigrationReviewCodes,
+    type PreparedSettings,
+    type SettingsMigrationReviewCode,
+    type SettingsMigrationReviewReason,
+    type SettingsMigrationState,
+};
 export { KeyIndexOfSettings };
 
 export { type HasSettings };
@@ -321,7 +389,21 @@ export { confDesc };
 
 export { TweakValuesTemplate };
 export type { TweakValues };
+export type {
+    TweakAssessment,
+    TweakAssessmentEntry,
+    TweakAssessmentRelation,
+    TweakAssessmentValue,
+    TweakReconstruction,
+    TweakTransition,
+    TweakTransitionReason,
+};
 export { DEVICE_ID_PREFERRED };
+export { RemotePreferredTweakStatuses };
+export type { RemotePreferredTweakStatus };
+export { RemotePreferredTweakNotConfiguredReasons };
+export type { RemotePreferredTweakNotConfiguredReason };
+export type { RemotePreferredTweakResult };
 
 export type { NodeKey };
 export type { DeviceInfo };
@@ -411,4 +493,10 @@ export { DOCID_JOURNAL_SYNC_PARAMETERS };
 export type { SyncParameters };
 export { DEFAULT_SYNC_PARAMETERS };
 
-export { SETTING_KEY_P2P_DEVICE_NAME, configURIBase, configURIBaseQR, SuffixDatabaseName, ExtraSuffixIndexedDB };
+export {
+    SETTING_KEY_P2P_DEVICE_NAME,
+    configURIBase,
+    configURIBaseQR,
+    SuffixDatabaseName,
+    ExtraSuffixIndexedDB,
+};

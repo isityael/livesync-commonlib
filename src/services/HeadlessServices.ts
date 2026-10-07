@@ -19,12 +19,15 @@ import type { ServiceInstances } from "@lib/services/ServiceHub";
 import { UIService } from "@lib/services/implements/base/UIService";
 import { HeadlessAPIService } from "./implements/headless/HeadlessAPIService";
 import { HeadlessDatabaseService, HeadlessKeyValueDBService } from "./implements/headless/HeadlessDatabaseService";
-import { SvelteDialogManagerBase, type ComponentHasResult } from "./implements/base/SvelteDialog";
+import type { ComponentHasResult, SvelteDialogManager } from "./implements/base/SvelteDialog";
 import type { DatabaseService } from "@lib/services/base/DatabaseService.ts";
 import { ControlService } from "./base/ControlService";
 import { InjectableSettingService } from "./implements/injectable/InjectableSettingService";
-import type { IControlService } from "./base/IService";
 import type { Constructor } from "@lib/common/utils.type";
+import { createIndexedDBKeyValueDatabaseFactory } from "@lib/databases/IndexedDBKeyValueDatabase";
+import type { KeyValueDatabaseFactory } from "@lib/interfaces/KeyValueDatabase";
+import type { PouchDBConstructor } from "@lib/pouchdb/PouchDBConstructor.ts";
+import type { ObsidianLiveSyncSettings } from "@lib/common/types";
 
 class HeadlessAppLifecycleService<T extends ServiceContext> extends InjectableAppLifecycleService<T> {
     constructor(context: T, dependencies: AppLifecycleServiceDependencies) {
@@ -35,18 +38,20 @@ class HeadlessAppLifecycleService<T extends ServiceContext> extends InjectableAp
     }
 }
 
-class HeadlessSvelteDialogManager<T extends ServiceContext> extends SvelteDialogManagerBase<T> {
+class HeadlessSvelteDialogManager<T extends ServiceContext> implements SvelteDialogManager<T> {
     openSvelteDialog<T, U>(component: ComponentHasResult<T, U>, initialData?: U): Promise<T | undefined> {
+        throw new Error("Method not implemented.");
+    }
+    open<T, U = T>(component: ComponentHasResult<T, U>, initialData?: U): Promise<T | undefined> {
+        return this.openSvelteDialog(component, initialData);
+    }
+    openWithExplicitCancel<T, U = T>(component: ComponentHasResult<T, U>, initialData?: U): Promise<T> {
         throw new Error("Method not implemented.");
     }
 }
 
 type HeadlessUIServiceDependencies<T extends ServiceContext = ServiceContext> = {
-    appLifecycle: AppLifecycleService<T>;
-    config: ConfigServiceBrowserCompat<T>;
-    replicator: InjectableReplicatorService<T>;
     APIService: HeadlessAPIService<T>;
-    control: IControlService;
 };
 
 class HeadlessUIService<T extends ServiceContext> extends UIService<T> {
@@ -54,16 +59,8 @@ class HeadlessUIService<T extends ServiceContext> extends UIService<T> {
         throw new Error("Method not implemented.");
     }
     constructor(context: T, dependents: HeadlessUIServiceDependencies<T>) {
-        const headlessConfirm = dependents.APIService.confirm;
-        const headlessSvelteDialogManager = new HeadlessSvelteDialogManager<T>(context, {
-            confirm: headlessConfirm,
-            appLifecycle: dependents.appLifecycle,
-            config: dependents.config,
-            replicator: dependents.replicator,
-            control: dependents.control,
-        });
+        const headlessSvelteDialogManager = new HeadlessSvelteDialogManager<T>();
         super(context, {
-            appLifecycle: dependents.appLifecycle,
             dialogManager: headlessSvelteDialogManager,
             APIService: dependents.APIService,
         });
@@ -73,23 +70,35 @@ class HeadlessUIService<T extends ServiceContext> extends UIService<T> {
 
 export class HeadlessServiceHub<T extends ServiceContext> extends InjectableServiceHub<T> {
     constructor(
-        _context?: T,
+        _context: T | undefined,
         overrideServiceConstructor: {
+            /** PouchDB with the adapters required by this headless runtime. */
+            pouchDB: PouchDBConstructor;
             database?: Constructor<DatabaseService<T>>;
-        } = {}
+            openKeyValueDatabase?: KeyValueDatabaseFactory;
+            onDisplayLanguageChanged?: (language: ObsidianLiveSyncSettings["displayLanguage"]) => void;
+            /** Optional host capability when path obfuscation uses a secret distinct from content encryption. */
+            getPathObfuscationPassphrase?: () => string | false;
+            /** Direct database clients do not run application-level replication or key-value database lifecycles. */
+            databaseLifecycleMode?: "application" | "direct-access";
+        }
     ) {
         const context = (_context ?? new ServiceContext()) as T;
+        const registerApplicationDatabaseLifecycle =
+            (overrideServiceConstructor.databaseLifecycleMode ?? "application") === "application";
         const API = new HeadlessAPIService<T>(context);
         const conflict = new InjectableConflictService(context);
         const fileProcessing = new InjectableFileProcessingService(context);
 
         const setting = new InjectableSettingService(context, {
             APIService: API,
+            onDisplayLanguageChanged: overrideServiceConstructor.onDisplayLanguageChanged,
         });
         const appLifecycle = new HeadlessAppLifecycleService<T>(context, {
             settingService: setting,
         });
         const remote = new InjectableRemoteService(context, {
+            pouchDB: overrideServiceConstructor.pouchDB,
             APIService: API,
             appLifecycle: appLifecycle,
             setting: setting,
@@ -103,8 +112,10 @@ export class HeadlessServiceHub<T extends ServiceContext> extends InjectableServ
         const databaseEvents = new InjectableDatabaseEventService(context);
         const path = new PathServiceCompat(context, {
             settingService: setting,
+            getPathObfuscationPassphrase: overrideServiceConstructor.getPathObfuscationPassphrase,
         });
         const database = new (overrideServiceConstructor.database ?? HeadlessDatabaseService<T>)(context, {
+            pouchDB: overrideServiceConstructor.pouchDB,
             API: API,
             path: path,
             vault: vault,
@@ -118,6 +129,7 @@ export class HeadlessServiceHub<T extends ServiceContext> extends InjectableServ
             settingService: setting,
             appLifecycleService: appLifecycle,
             databaseEventService: databaseEvents,
+            registerLifecycleHandlers: registerApplicationDatabaseLifecycle,
         });
         const replication = new InjectableReplicationService(context, {
             APIService: API,
@@ -129,9 +141,12 @@ export class HeadlessServiceHub<T extends ServiceContext> extends InjectableServ
         });
 
         const keyValueDB = new HeadlessKeyValueDBService(context, {
+            openKeyValueDatabase:
+                overrideServiceConstructor.openKeyValueDatabase ?? createIndexedDBKeyValueDatabaseFactory(),
             appLifecycle: appLifecycle,
             databaseEvents: databaseEvents,
             vault: vault,
+            registerLifecycleHandlers: registerApplicationDatabaseLifecycle,
         });
         const control = new ControlService(context, {
             appLifecycleService: appLifecycle,
@@ -142,11 +157,7 @@ export class HeadlessServiceHub<T extends ServiceContext> extends InjectableServ
             replicatorService: replicator,
         });
         const ui = new HeadlessUIService<T>(context, {
-            appLifecycle,
-            config,
-            replicator,
             APIService: API,
-            control: control,
         });
         // Using 'satisfies' to ensure all services are provided
         const serviceInstancesToInit = {

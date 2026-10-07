@@ -17,9 +17,106 @@ import type { AppLifecycleService } from "@lib/services/base/AppLifecycleService
 import type { SettingService } from "@lib/services/base/SettingService";
 import { UnresolvedErrorManager } from "@lib/services/base/UnresolvedErrorManager";
 import { createInstanceLogFunction, MARK_LOG_NETWORK_ERROR, type LogFunction } from "@lib/services/lib/logUtils";
-import { PouchDB } from "@lib/pouchdb/pouchdb-browser.ts";
+import { runWithTrackedPhysicalRequest } from "@lib/services/lib/remoteActivity.ts";
+import type PouchDB from "pouchdb-core";
+import type { PouchDBConstructor } from "@lib/pouchdb/PouchDBConstructor.ts";
 import { LiveSyncError } from "@lib/common/LSError";
+import type { OwnedCouchDBConnection, RemoteConnectionOpenOptions } from "./RemoteConnection.ts";
+
+type RemoteConnectionScope = {
+    readonly signal: AbortSignal;
+    combine(signal?: AbortSignal | null): AbortSignal;
+    abort(reason?: unknown): void;
+};
+
+function createRemoteConnectionScope(ownerSignal?: AbortSignal): RemoteConnectionScope {
+    const controller = new AbortController();
+    const combinedSignals = new WeakMap<AbortSignal, AbortSignal>();
+    let detachOwner = () => {};
+    const abort = (reason?: unknown) => {
+        detachOwner();
+        if (!controller.signal.aborted) {
+            controller.abort(reason);
+        }
+    };
+    if (ownerSignal?.aborted) {
+        abort(ownerSignal.reason);
+    } else if (ownerSignal) {
+        const onOwnerAbort = () => abort(ownerSignal.reason);
+        ownerSignal.addEventListener("abort", onOwnerAbort, { once: true });
+        detachOwner = () => ownerSignal.removeEventListener("abort", onOwnerAbort);
+    }
+    const combine = (signal?: AbortSignal | null) => {
+        if (!signal || signal === controller.signal) return controller.signal;
+        const cached = combinedSignals.get(signal);
+        if (cached) return cached;
+        const combined = combineAbortSignals(signal, controller.signal);
+        combinedSignals.set(signal, combined);
+        return combined;
+    };
+    return { signal: controller.signal, combine, abort };
+}
+
+function combineAbortSignals(first: AbortSignal, second: AbortSignal): AbortSignal {
+    if (first === second) return first;
+
+    const abortSignalWithAny = AbortSignal as typeof AbortSignal & {
+        any?: (signals: AbortSignal[]) => AbortSignal;
+    };
+    if (typeof abortSignalWithAny.any === "function") {
+        return abortSignalWithAny.any([first, second]);
+    }
+
+    // Older hosts do not provide AbortSignal.any(). Keep both cancellation
+    // sources without replacing PouchDB's per-request signal.
+    const controller = new AbortController();
+    const listeners = new Map<AbortSignal, () => void>();
+    const detach = () => {
+        for (const [signal, listener] of listeners) {
+            signal.removeEventListener("abort", listener);
+        }
+        listeners.clear();
+    };
+    const abortFrom = (signal: AbortSignal) => {
+        detach();
+        if (!controller.signal.aborted) {
+            controller.abort(signal.reason);
+        }
+    };
+    for (const signal of [first, second]) {
+        if (signal.aborted) {
+            abortFrom(signal);
+            break;
+        }
+        const listener = () => abortFrom(signal);
+        listeners.set(signal, listener);
+        signal.addEventListener("abort", listener, { once: true });
+    }
+    return controller.signal;
+}
+
+function createCouchDBConnection<T extends object>(
+    db: PouchDB.Database<T>,
+    info: PouchDB.Core.DatabaseInfo,
+    scope: RemoteConnectionScope
+): OwnedCouchDBConnection<T> {
+    let closePromise: Promise<void> | undefined;
+    return {
+        db,
+        info,
+        close: () => {
+            closePromise ??= (async () => {
+                scope.abort(new Error("Remote connection closed."));
+                await db.close();
+            })();
+            return closePromise;
+        },
+    };
+}
+
 export interface RemoteServiceDependencies {
+    /** PouchDB with the HTTP adapter required by the host runtime already registered. */
+    pouchDB: PouchDBConstructor;
     APIService: APIService;
     appLifecycle: AppLifecycleService;
     setting: SettingService;
@@ -39,27 +136,13 @@ export abstract class RemoteService<T extends ServiceContext = ServiceContext>
     extends ServiceBase<T>
     implements IRemoteService
 {
-    /**
-     * Connect to the remote database with the provided settings.
-     * @param uri  The URI of the remote database.
-     * @param auth  The authentication credentials for the remote database.
-     * @param disableRequestURI  Whether to disable the request URI.
-     * @param passphrase  The passphrase for the remote database.
-     * @param useDynamicIterationCount  Whether to use dynamic iteration count.
-     * @param performSetup  Whether to perform setup.
-     * @param skipInfo  Whether to skip information retrieval.
-     * @param compression  Whether to enable compression.
-     * @param customHeaders  Custom headers to include in the request.
-     * @param useRequestAPI  Whether to use the request API.
-     * @param getPBKDF2Salt  Function to retrieve the PBKDF2 salt.
-     * Note that this function is used for CouchDB and compatible only.
-     */
     protected _log: LogFunction;
     protected _authHeader = new AuthorizationHeaderGenerator();
     protected _APIService: APIService;
     protected _appLifecycleService: AppLifecycleService;
     protected _settingService: SettingService;
     protected _unresolvedErrors: UnresolvedErrorManager;
+    protected _pouchDB: PouchDBConstructor;
     protected last_successful_post = false;
 
     get hadLastPostFailedBySize(): boolean {
@@ -68,11 +151,12 @@ export abstract class RemoteService<T extends ServiceContext = ServiceContext>
 
     constructor(context: T, dependencies: RemoteServiceDependencies) {
         super(context);
+        this._pouchDB = dependencies.pouchDB;
         this._APIService = dependencies.APIService;
         this._appLifecycleService = dependencies.appLifecycle;
         this._settingService = dependencies.setting;
         this._log = createInstanceLogFunction("RemoteService", dependencies.APIService);
-        this._unresolvedErrors = new UnresolvedErrorManager(this._appLifecycleService);
+        this._unresolvedErrors = new UnresolvedErrorManager(this._appLifecycleService, this.context.events);
     }
 
     showError(msg: string, max_log_level: LOG_LEVEL = LOG_LEVEL_NOTICE) {
@@ -92,45 +176,67 @@ export abstract class RemoteService<T extends ServiceContext = ServiceContext>
         const fetchFunction = useNativeFetch
             ? this._APIService.nativeFetch.bind(this._APIService)
             : this._APIService.webCompatFetch.bind(this._APIService);
-        this._APIService.requestCount.value = this._APIService.requestCount.value + 1;
-        const response = await fetchFunction(req, opts);
-        const method = opts?.method ?? "GET";
-        if (method == "POST" || method == "PUT") {
-            this.last_successful_post = response.ok;
-        } else {
-            this.last_successful_post = true;
-        }
-        const url = new URL(typeof req === "string" ? req : req.url);
-        const localURL = `${url.protocol}//${url.host}${url.pathname}`;
-        this._log(`[REQ] (${method}) ${localURL} -> ${response.status}`, LOG_LEVEL_DEBUG);
-        if (Math.floor(response.status / 100) !== 2) {
-            if (response.status == 404) {
-                if (method === "GET" && url.pathname.indexOf("/_local/") === -1) {
+        return await runWithTrackedPhysicalRequest(this._APIService, async () => {
+            const response = await fetchFunction(req, opts);
+            const method = opts?.method ?? "GET";
+            if (method == "POST" || method == "PUT") {
+                this.last_successful_post = response.ok;
+            } else {
+                this.last_successful_post = true;
+            }
+            const url = new URL(typeof req === "string" ? req : req.url);
+            const localURL = `${url.protocol}//${url.host}${url.pathname}`;
+            this._log(`[REQ] (${method}) ${localURL} -> ${response.status}`, LOG_LEVEL_DEBUG);
+            if (Math.floor(response.status / 100) !== 2) {
+                if (response.status == 404) {
+                    if (method === "GET" && url.pathname.indexOf("/_local/") === -1) {
+                        this._log(
+                            `Just checkpoint or some server information has been missing. The 404 error shown above is not an error.`,
+                            LOG_LEVEL_VERBOSE
+                        );
+                    }
+                } else {
+                    const r = response.clone();
                     this._log(
-                        `Just checkpoint or some server information has been missing. The 404 error shown above is not an error.`,
-                        LOG_LEVEL_VERBOSE
+                        `The request may have failed. The reason sent by the server: ${r.status}: ${r.statusText}`,
+                        LOG_LEVEL_NOTICE
                     );
+                    try {
+                        const result = await r.text();
+                        this._log(result, LOG_LEVEL_VERBOSE);
+                    } catch (_) {
+                        this._log("Could not fetch response body", LOG_LEVEL_VERBOSE);
+                        this._log(_, LOG_LEVEL_VERBOSE);
+                    }
                 }
             } else {
-                const r = response.clone();
-                this._log(
-                    `The request may have failed. The reason sent by the server: ${r.status}: ${r.statusText}`,
-                    LOG_LEVEL_NOTICE
-                );
-                try {
-                    const result = await r.text();
-                    this._log(result, LOG_LEVEL_VERBOSE);
-                } catch (_) {
-                    this._log("Could not fetch response body", LOG_LEVEL_VERBOSE);
-                    this._log(_, LOG_LEVEL_VERBOSE);
-                }
+                this.clearErrors();
             }
-        } else {
-            this.clearErrors();
-        }
-        return response;
+            return response;
+        });
     }
 
+    /**
+     * Opens a remote CouchDB connection with request cancellation bound to its
+     * owner.
+     *
+     * @param uri - The URI of the remote database.
+     * @param auth - Authentication credentials for the remote database.
+     * @param disableRequestURI - Whether request URI handling is disabled.
+     * @param passphrase - The database encryption passphrase, or `false` when
+     * encryption is disabled.
+     * @param useDynamicIterationCount - Whether legacy dynamic iteration counts
+     * are enabled.
+     * @param performSetup - Whether PouchDB may set up a missing database.
+     * @param skipInfo - Whether to omit the opening database information request.
+     * @param compression - Whether chunk compression is enabled.
+     * @param customHeaders - Additional HTTP headers for every request.
+     * @param useRequestAPI - Whether to use the host-native request adapter.
+     * @param getPBKDF2Salt - Resolves the PBKDF2 salt when encryption needs it.
+     * @param connectionOptions - Ownership and request fallback options.
+     * @returns An error description, or the owned connection. The caller must
+     * transfer ownership or call `close()`.
+     */
     async connect(
         uri: string,
         auth: CouchDBCredentials,
@@ -142,14 +248,16 @@ export abstract class RemoteService<T extends ServiceContext = ServiceContext>
         compression: boolean,
         customHeaders: Record<string, string>,
         useRequestAPI: boolean,
-        getPBKDF2Salt: () => Promise<Uint8Array<ArrayBuffer>>
-    ): Promise<string | { db: PouchDB.Database<EntryDoc>; info: PouchDB.Core.DatabaseInfo }> {
+        getPBKDF2Salt: () => Promise<Uint8Array<ArrayBuffer>>,
+        connectionOptions: RemoteConnectionOpenOptions = {}
+    ): Promise<string | OwnedCouchDBConnection<EntryDoc>> {
         if (!isValidRemoteCouchDBURI(uri)) return "Remote URI is not valid";
         if (uri.toLowerCase() != uri) return "Remote URI and database name could not contain capital letters.";
         if (uri.indexOf(" ") !== -1) return "Remote URI and database name could not contain spaces.";
         if (!this._APIService.isOnline) {
             return "Network is offline";
         }
+        const connectionScope = createRemoteConnectionScope(connectionOptions.signal);
         // let authHeader = await this._authHeader.getAuthorizationHeader(auth);
         const conf: PouchDB.HttpAdapter.HttpAdapterConfiguration = {
             adapter: "http",
@@ -188,7 +296,6 @@ export abstract class RemoteService<T extends ServiceContext = ServiceContext>
                         headers.append("authorization", authHeader);
                     }
                     try {
-                        this._APIService.requestCount.value = this._APIService.requestCount.value + 1;
                         // const response: Response = await (useRequestAPI
                         //     ? this.nativeFetch(url.toString(), { ...opts, headers })
                         //     : this.webCompatFetch(url, { ...opts, headers }));
@@ -222,14 +329,19 @@ export abstract class RemoteService<T extends ServiceContext = ServiceContext>
                         //     }
                         // }
                         // this.clearErrors();
+                        const signal = connectionScope.combine(opts?.signal);
+                        // A rebuild can replace ciphertext while preserving document revision ETags.
                         const response = await this.performFetch(
                             requestSrc,
-                            { ...opts, headers },
+                            { ...opts, headers, signal, cache: "no-store" },
                             useRequestAPI ? FetchMethod.native : FetchMethod.webCompat
                         );
                         return response;
                     } catch (ex) {
                         if (ex instanceof TypeError) {
+                            if (connectionScope.signal.aborted || connectionOptions.allowNativeFallback === false) {
+                                throw ex;
+                            }
                             if (useRequestAPI) {
                                 this._log("Failed to request by API.");
                                 throw ex;
@@ -241,7 +353,11 @@ export abstract class RemoteService<T extends ServiceContext = ServiceContext>
                             //     ...opts,
                             //     headers,
                             // });
-                            const resp2 = await this.performFetch(requestSrc, { ...opts, headers }, FetchMethod.native);
+                            const resp2 = await this.performFetch(
+                                requestSrc,
+                                { ...opts, headers, cache: "no-store" },
+                                FetchMethod.native
+                            );
                             if (resp2.status / 100 == 2) {
                                 this.showError(
                                     "The request was successful by API. But the native fetch API failed! Please check CORS settings on the remote database!. While this condition, you cannot enable LiveSync",
@@ -259,7 +375,12 @@ export abstract class RemoteService<T extends ServiceContext = ServiceContext>
                 } catch (ex) {
                     this._log(`HTTP:${method}${size} to:${localURL} -> failed`, LOG_LEVEL_VERBOSE);
                     const msg = ex instanceof Error ? `${ex?.name}:${ex?.message}` : ex?.toString();
-                    this.showError(`${MARK_LOG_NETWORK_ERROR}Network Error: Failed to fetch: ${msg}`, LOG_LEVEL_INFO); // Do not show notice, due to throwing below
+                    if (!connectionScope.signal.aborted) {
+                        this.showError(
+                            `${MARK_LOG_NETWORK_ERROR}Network Error: Failed to fetch: ${msg}`,
+                            LOG_LEVEL_INFO
+                        ); // Do not show notice, due to throwing below
+                    }
                     this._log(ex, LOG_LEVEL_VERBOSE);
                     // limit only in bulk_docs.
                     if (url.toString().indexOf("_bulk_docs") !== -1) {
@@ -267,29 +388,58 @@ export abstract class RemoteService<T extends ServiceContext = ServiceContext>
                     }
                     this._log(ex);
                     throw ex;
-                } finally {
-                    this._APIService.responseCount.value = this._APIService.responseCount.value + 1;
                 }
                 // return await fetch(url, opts);
             },
         };
-        const setting = this._settingService.currentSettings();
-        const db = new PouchDB<EntryDoc>(uri, conf as any) as unknown as PouchDB.Database<EntryDoc>;
-        replicationFilter(db, compression);
-        disableEncryption();
-        if (passphrase !== "false" && typeof passphrase === "string") {
-            enableEncryption(db, passphrase, useDynamicIterationCount, false, getPBKDF2Salt, setting.E2EEAlgorithm);
+        const encryptionAlgorithm =
+            connectionOptions.encryptionAlgorithm ?? this._settingService.currentSettings().E2EEAlgorithm;
+        let db: PouchDB.Database<EntryDoc>;
+        try {
+            db = new this._pouchDB<EntryDoc>(uri, conf);
+        } catch (ex) {
+            connectionScope.abort(ex);
+            throw ex;
+        }
+        const compatibilityInfo = { db_name: "", doc_count: 0, update_seq: "" };
+        const connection = createCouchDBConnection(db, compatibilityInfo, connectionScope);
+        const closeAfterConnectionFailure = async () => {
+            try {
+                await connection.close();
+            } catch (closeError) {
+                this._log("Failed to close remote database after connection failure.", LOG_LEVEL_INFO);
+                this._log(closeError, LOG_LEVEL_VERBOSE);
+            }
+        };
+        try {
+            replicationFilter(db, compression);
+            disableEncryption();
+            if (passphrase !== "false" && typeof passphrase === "string") {
+                enableEncryption(
+                    db,
+                    passphrase,
+                    useDynamicIterationCount,
+                    false,
+                    getPBKDF2Salt,
+                    encryptionAlgorithm,
+                    connectionOptions.encryptInternalMetadata ?? false
+                );
+            }
+        } catch (ex) {
+            await closeAfterConnectionFailure();
+            throw ex;
         }
         if (skipInfo) {
-            return { db: db, info: { db_name: "", doc_count: 0, update_seq: "" } };
+            return connection;
         }
         try {
             const info = await db.info();
-            return { db: db, info: info };
+            return { ...connection, info };
         } catch (ex) {
             const exMsg = ex instanceof Error ? ex : LiveSyncError.fromError(ex);
             const msg = `${exMsg.name}:${exMsg.message}`;
             this._log(ex, LOG_LEVEL_VERBOSE);
+            await closeAfterConnectionFailure();
             return msg;
         }
     }

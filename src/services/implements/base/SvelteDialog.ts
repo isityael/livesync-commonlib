@@ -4,9 +4,7 @@ import type { ReplicatorService } from "@lib/services/base/ReplicatorService";
 import type { Confirm } from "@lib/interfaces/Confirm";
 import { getContext, mount, setContext, unmount, type Component } from "svelte";
 import { LOG_LEVEL_NOTICE, Logger } from "@lib/common/logger";
-import { $msg } from "@lib/common/i18n";
 import { fireAndForget, promiseWithResolvers, type PromiseWithResolvers } from "octagonal-wheels/promises";
-import { eventHub } from "@lib/hub/hub";
 import { EVENT_PLUGIN_UNLOADED } from "@lib/events/coreEvents";
 
 import type { ServiceContext } from "@lib/services/base/ServiceBase";
@@ -59,6 +57,17 @@ export type DialogContext<C extends ServiceContext = ServiceContext, T = any, U 
     services: SvelteDialogManagerDependencies<C>;
 };
 
+export interface SvelteDialogManager<T extends ServiceContext> {
+    open<TResult, TInitial = TResult>(
+        component: ComponentHasResult<TResult, TInitial>,
+        initialData?: TInitial
+    ): Promise<TResult | undefined>;
+    openWithExplicitCancel<TResult, TInitial = TResult>(
+        component: ComponentHasResult<TResult, TInitial>,
+        initialData?: TInitial
+    ): Promise<TResult>;
+}
+
 export const CONTEXT_DIALOG_CONTROLS = "svelte-dialog-controls";
 export function setupDialogContext<T extends DialogContext>(controls: T) {
     setContext(CONTEXT_DIALOG_CONTROLS, controls);
@@ -80,8 +89,33 @@ export interface IModalBase {
     onClose(): void;
     open(): void;
 }
-export function SvelteDialogMixIn<TBase extends Constructor<IModalBase>>(TBase: TBase, d: Component<DialogHostProps>) {
-    return class SvelteDialog<
+
+export interface SvelteDialogInstance<T, U, C extends ServiceContext = ServiceContext> extends IModalBase {
+    initDialog(
+        context: C,
+        dependents: SvelteDialogManagerDependencies<C>,
+        component: ComponentHasResult<T, U>,
+        initialData?: U
+    ): void;
+    waitForClose(): Promise<T | undefined>;
+}
+
+export type SvelteDialogClass<TBase extends Constructor<IModalBase>> = {
+    new <T, U, C extends ServiceContext = ServiceContext>(
+        ...args: ConstructorParameters<TBase>
+    ): SvelteDialogInstance<T, U, C>;
+};
+
+/**
+ * Adds Svelte dialogue state to a modal class through dynamic inheritance.
+ *
+ * @deprecated Compose the dialogue lifecycle explicitly in the owning host.
+ */
+export function SvelteDialogMixIn<TBase extends Constructor<IModalBase>>(
+    TBase: TBase,
+    d: Component<DialogHostProps>
+): SvelteDialogClass<TBase> {
+    const SvelteDialog = class SvelteDialog<
         T,
         U,
         C extends ServiceContext = ServiceContext,
@@ -119,7 +153,7 @@ export function SvelteDialogMixIn<TBase extends Constructor<IModalBase>>(TBase: 
         resultPromiseWithResolvers?: PromiseWithResolvers<T | undefined>;
         override onOpen() {
             const { contentEl } = this;
-            contentEl.empty();
+            contentEl.replaceChildren();
             // eslint-disable-next-line @typescript-eslint/no-this-alias
             const dialog = this;
 
@@ -127,7 +161,7 @@ export function SvelteDialogMixIn<TBase extends Constructor<IModalBase>>(TBase: 
                 this.resultPromiseWithResolvers.reject("Dialog opened again");
             }
             const pr = promiseWithResolvers<T | undefined>();
-            eventHub.once(EVENT_PLUGIN_UNLOADED, () => {
+            this.context.events.once(EVENT_PLUGIN_UNLOADED, () => {
                 if (this.resultPromiseWithResolvers === pr) {
                     pr.reject("Plugin unloaded");
                     this.close();
@@ -173,9 +207,10 @@ export function SvelteDialogMixIn<TBase extends Constructor<IModalBase>>(TBase: 
             });
         }
     };
+    return SvelteDialog as SvelteDialogClass<TBase>;
 }
 
-export abstract class SvelteDialogManagerBase<T extends ServiceContext> {
+export abstract class SvelteDialogManagerBase<T extends ServiceContext> implements SvelteDialogManager<T> {
     abstract openSvelteDialog<T, U = T>(component: ComponentHasResult<T, U>, initialData?: U): Promise<T | undefined>;
 
     protected _context: T;
@@ -204,7 +239,10 @@ export abstract class SvelteDialogManagerBase<T extends ServiceContext> {
             if (this.dependents.control.hasUnloaded()) {
                 throw new Error("Operation cancelled due to app shutdown.");
             }
-            Logger($msg("Please select 'Cancel' explicitly to cancel this operation."), LOG_LEVEL_NOTICE);
+            Logger(
+                this.context.translate("Please select 'Cancel' explicitly to cancel this operation."),
+                LOG_LEVEL_NOTICE
+            );
         }
         throw new Error("Operation Forcibly cancelled by user.");
     }

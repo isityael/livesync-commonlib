@@ -16,13 +16,16 @@ import type {
     MISSING_OR_ERROR,
     ObsidianLiveSyncSettings,
     RemoteDBSettings,
+    RemotePreferredTweakResult,
+    SettingsMigrationState,
+    TweakAssessment,
     TweakValues,
     UXFileInfo,
     UXFileInfoStub,
 } from "@lib/common/types";
 
 import type { LiveSyncLocalDB } from "@lib/pouchdb/LiveSyncLocalDB";
-import type { LiveSyncAbstractReplicator } from "@lib/replication/LiveSyncAbstractReplicator";
+import type { ReplicatorInstance } from "@lib/replication/ReplicatorInstance";
 import type { SimpleStore } from "octagonal-wheels/databases/SimpleStoreBase";
 import type { Confirm } from "@lib/interfaces/Confirm";
 import type { ReactiveSource } from "octagonal-wheels/dataobject/reactive";
@@ -30,6 +33,26 @@ import type { ReplicationStatics } from "@lib/common/models/shared.definition";
 import type { ReplicatorService } from "./ReplicatorService";
 import type { DatabaseEventService } from "./DatabaseEventService";
 import type { BASE_IS_NEW, EVEN, TARGET_IS_NEW } from "@lib/common/models/shared.const.symbols";
+import type { AsyncActivityOptions } from "@lib/interfaces/AsyncActivityRunner.ts";
+import type { OwnedCouchDBConnection, RemoteConnectionOpenOptions } from "./RemoteConnection.ts";
+import type {
+    ActiveReplicatorContext,
+    ContinuousReplicationRequest,
+    ReplicationAttemptFailure,
+    ReplicationFailureRequest,
+    ReplicatorProviderDefinitionMap,
+    ReplicationOutcome,
+    ReplicationReadinessRequirements,
+    UnattendedOneShotRequest,
+    UserInitiatedOneShotRequest,
+} from "@lib/replication/ReplicatorProvider.ts";
+import type { RemoteResourceKind, RemoteResourceMap } from "@lib/replication/RemoteResource.ts";
+import type {
+    CentralRemoteAdministrationRequest,
+    CentralRemoteAdministrationResult,
+} from "@lib/replication/CentralRemoteAdministration.ts";
+import type { MultipleHandlerFunction } from "@lib/services/lib/HandlerUtils.ts";
+import type { VaultScanResult } from "./VaultScanResult.ts";
 
 declare global {
     interface OPTIONAL_SYNC_FEATURES {
@@ -88,6 +111,19 @@ export interface IPathService {
     id2path(id: DocumentID, entry?: EntryHasPath, stripPrefix?: boolean): FilePathWithPrefix;
 
     path2id(filename: FilePathWithPrefix | FilePath, prefix?: string): Promise<DocumentID>;
+    path2idWithSettings(
+        filename: FilePathWithPrefix | FilePath,
+        setting: Pick<
+            RemoteDBSettings,
+            | "encrypt"
+            | "usePathObfuscation"
+            | "passphrase"
+            | "handleFilenameCaseSensitive"
+            | "idDerivationVersion"
+            | "idDerivationKey"
+        >,
+        prefix?: string
+    ): Promise<DocumentID>;
     getPath(entry: AnyEntry): FilePathWithPrefix;
     markChangesAreSame(
         old: UXFileInfo | AnyEntry | FilePathWithPrefix,
@@ -119,6 +155,8 @@ export interface IDatabaseService {
 
     resetDatabase(): Promise<boolean>;
 
+    resetDatabaseForCurrentSettings(params: openDatabaseParameters): Promise<boolean>;
+
     onDatabaseReset: () => Promise<boolean>;
 
     onOpenDatabase: (vaultName: string) => Promise<boolean>;
@@ -138,7 +176,12 @@ export interface IDatabaseEventService {
 
     onResetDatabase(db: LiveSyncLocalDB): Promise<boolean>;
 
-    initialiseDatabase(showingNotice?: boolean, reopenDatabase?: boolean, ignoreSuspending?: boolean): Promise<boolean>;
+    initialiseDatabase(
+        showingNotice?: boolean,
+        reopenDatabase?: boolean,
+        ignoreSuspending?: boolean,
+        continueOnFileFailure?: boolean
+    ): Promise<VaultScanResult>;
 }
 export interface IKeyValueDBService {
     openSimpleStore<T>(kind: string): SimpleStore<T>;
@@ -157,37 +200,152 @@ export interface IFileProcessingService {
     onStorageFileEvent(): void;
 }
 export interface IReplicatorService {
+    /**
+     * Fence new work, drain admitted work, and close the active Replicator.
+     *
+     * Do not await this command from an admitted active-context callback: the
+     * retirement command waits for that callback to settle.
+     */
     onCloseActiveReplication(): Promise<boolean>;
 
-    onReplicatorInitialised(): Promise<boolean>;
+    /**
+     * Run host preparation after candidate initialisation and before active publication.
+     *
+     * This hook runs inside the ownership transition. A handler must not call or await
+     * `acquireActiveReplicatorContext()` or `runWithActiveReplicatorContext()`, because
+     * both wait for that same transition. Work which requires the new active context
+     * belongs after publication.
+     */
+    onBeforeReplicatorPublication(): Promise<boolean>;
 
-    getNewReplicator(
-        settingOverride?: Partial<ObsidianLiveSyncSettings>
-    ): Promise<LiveSyncAbstractReplicator | undefined | false>;
+    getNewReplicator: ReplicatorFactoryHandler;
 
-    getActiveReplicator(): LiveSyncAbstractReplicator | undefined;
+    /** Add the fixed provider definitions composed by the current host. */
+    registerReplicatorProviderDefinitions(definitions: ReplicatorProviderDefinitionMap): void;
+
+    /** Resolve one provider-owned finite resource without changing active publication. */
+    createRemoteResource<TKind extends RemoteResourceKind>(
+        kind: TKind,
+        setting: RemoteDBSettings
+    ): Promise<RemoteResourceMap[TKind] | undefined>;
+
+    /** Apply and verify one typed provider-specific central-remote administration action. */
+    runCentralRemoteAdministration(
+        request: CentralRemoteAdministrationRequest
+    ): Promise<CentralRemoteAdministrationResult>;
+
+    /** Wait for queued ownership transitions, then return the published active context. */
+    acquireActiveReplicatorContext(): Promise<ActiveReplicatorContext | undefined>;
+
+    /**
+     * Run one task against an exact active publication admitted before later transitions.
+     *
+     * Invocation is ordered with replacement and disposal. A later
+     * transition fences new admission, requests transfer cancellation, waits for
+     * admitted tasks, and only then closes the old Replicator. The
+     * callback must not initiate or await settings realisation, database
+     * replacement, Replicator retirement, or another operation which queues that
+     * same lifecycle transition. Stage such recovery after this promise settles.
+     * Terminal plug-in unload uses the same retirement drain before the local
+     * database closes. Reversible host suspension only requests transfer
+     * cancellation and retains the publication, so it is not a retirement fence.
+     *
+     * The callback is not invoked when no typed publication can be admitted.
+     */
+    runWithActiveReplicatorContext<TResult>(
+        task: (context: ActiveReplicatorContext) => TResult | PromiseLike<TResult>
+    ): Promise<TResult | undefined>;
+
+    /**
+     * Return the legacy unreserved view of the active Replicator.
+     *
+     * Missing active state retains its established diagnostic. New work must
+     * acquire or admit an `ActiveReplicatorContext` instead.
+     */
+    getActiveReplicator(): ReplicatorInstance | undefined;
+    /**
+     * Return whether a compatibility active Replicator exists without
+     * acquiring or returning it.
+     *
+     * This side-effect-free, non-owning predicate exists only for
+     * compatibility-state classification. Work must acquire or admit an
+     * `ActiveReplicatorContext` before using a Replicator.
+     */
+    hasActiveReplicator(): boolean;
     replicationStatics: ReactiveSource<ReplicationStatics>;
+    /** Number of finite remote operations currently in progress. */
+    boundedRemoteActivityCount: ReactiveSource<number>;
+    /** Number of finite replication operations which can still deliver database documents. */
+    finiteReplicationActivityCount: ReactiveSource<number>;
+    /** Runs a finite remote operation within the host activity policy. */
+    runBoundedRemoteActivity<T>(task: () => T | PromiseLike<T>, options?: AsyncActivityOptions): Promise<T>;
+    /** Runs finite replication which may place documents in the local database. */
+    runFiniteReplicationActivity<T>(task: () => T | PromiseLike<T>, options?: AsyncActivityOptions): Promise<T>;
 }
+
+export type ReplicatorFactoryCallback = (
+    settingOverride?: Partial<ObsidianLiveSyncSettings>
+) => Promise<ReplicatorInstance | undefined | false>;
+export type ReplicatorFactoryHandler = MultipleHandlerFunction<ReplicatorFactoryCallback>;
 export interface IReplicationService {
     processSynchroniseResult(doc: MetaEntry): Promise<boolean>;
 
     processOptionalSynchroniseResult(doc: LoadedEntry): Promise<boolean>;
     processVirtualDocument(docs: PouchDB.Core.ExistingDocument<EntryDoc>): Promise<boolean>;
     onBeforeReplicate(showMessage: boolean): Promise<boolean>;
-    checkConnectionFailure(): Promise<boolean | "CHECKAGAIN" | undefined>;
+    /** Prepare provider state which exists only for the central remote. */
+    onPrepareCentralRemoteReplication(showMessage: boolean): Promise<boolean>;
+    checkConnectionFailure(failure: ReplicationAttemptFailure): Promise<boolean | "CHECKAGAIN" | undefined>;
 
+    /** Lightweight, idempotent policy checks which every replication entry point may invoke. */
     onCheckReplicationReady(showMessage: boolean): Promise<boolean>;
-    isReplicationReady(showMessage: boolean): Promise<boolean>;
+    /**
+     * Evaluate ordered host and provider readiness without acquiring a Replicator.
+     *
+     * The provider requirements determine whether central-remote preparation
+     * applies. A false result means no remote work has been admitted.
+     */
+    isReplicationReady(showMessage: boolean, readiness?: ReplicationReadinessRequirements): Promise<boolean>;
+    /**
+     * Run one user-initiated typed capability against an atomically acquired context.
+     *
+     * Readiness precedes finite activity, and failure recovery receives only
+     * the interaction authority carried by the request.
+     */
+    replicateUserInitiated(request?: UserInitiatedOneShotRequest): Promise<ReplicationOutcome>;
+    /**
+     * Run one unattended typed capability without granting interaction authority.
+     *
+     * Readiness precedes finite activity, and failed outcomes reach unattended
+     * recovery only after activity accounting has settled.
+     */
+    replicateUnattended(request: UnattendedOneShotRequest): Promise<ReplicationOutcome>;
+    /** Serialise and rate-limit an unattended event-triggered finite capability. */
+    replicateUnattendedByEvent(request: UnattendedOneShotRequest): Promise<ReplicationOutcome>;
+    /**
+     * Start a supported continuous capability after its provider-specific readiness.
+     *
+     * Applicability is checked before readiness. Continuous work is not wrapped
+     * as finite activity and does not use the finite-operation recovery handler.
+     */
+    startContinuous(request: ContinuousReplicationRequest): Promise<ReplicationOutcome>;
+    /**
+     * Stop finite transfer work on the current typed active Replicator.
+     *
+     * This operator action bypasses readiness, finite activity accounting, and
+     * failure-recovery handlers.
+     */
+    stopActiveTransfer(): Promise<ReplicationOutcome>;
     performReplication(showMessage?: boolean): Promise<boolean | void>;
     replicate(showMessage?: boolean): Promise<boolean | void>;
     replicateByEvent(showMessage?: boolean): Promise<boolean | void>;
-    onReplicationFailed(showMessage?: boolean): Promise<boolean>;
+    onReplicationFailed(request: ReplicationFailureRequest): Promise<boolean>;
     parseSynchroniseResult(docs: Array<PouchDB.Core.ExistingDocument<EntryDoc>>): Promise<boolean>;
     databaseQueueCount: ReactiveSource<number>;
     storageApplyingCount: ReactiveSource<number>;
     replicationResultCount: ReactiveSource<number>;
 
-    replicateAllToRemote(showingNotice?: boolean, sendChunksInBulkDisabled?: boolean): Promise<boolean>;
+    replicateAllToRemote(showingNotice?: boolean): Promise<boolean>;
 
     replicateAllFromRemote(showingNotice?: boolean): Promise<boolean>;
 
@@ -198,6 +356,22 @@ export interface IReplicationService {
     markResolved(): Promise<void>;
 }
 export interface IRemoteService {
+    /**
+     * Opens an owned remote CouchDB connection.
+     *
+     * @remarks
+     * The caller must transfer ownership or call `close()` on the returned
+     * connection. Closing it aborts outstanding abort-capable requests before
+     * closing the PouchDB handle. Host-native request adapters may not honour
+     * `AbortSignal`; callers must not report those requests as cancelled without
+     * a host guarantee.
+     *
+     * @returns An error description, or an owned remote connection. When
+     * `skipInfo` is true, the `info` field retains its compatibility placeholder.
+     *
+     * @throws When PouchDB construction or local connection configuration fails
+     * before a connection result can be produced.
+     */
     connect(
         uri: string,
         auth: CouchDBCredentials,
@@ -209,14 +383,9 @@ export interface IRemoteService {
         compression: boolean,
         customHeaders: Record<string, string>,
         useRequestAPI: boolean,
-        getPBKDF2Salt: () => Promise<Uint8Array<ArrayBuffer>>
-    ): Promise<
-        | string
-        | {
-              db: PouchDB.Database<EntryDoc>;
-              info: PouchDB.Core.DatabaseInfo;
-          }
-    >;
+        getPBKDF2Salt: () => Promise<Uint8Array<ArrayBuffer>>,
+        options?: RemoteConnectionOpenOptions
+    ): Promise<string | OwnedCouchDBConnection<EntryDoc>>;
 
     /**
      * State if the last POST request failed due to payload size.
@@ -291,7 +460,6 @@ export interface ISettingService {
     onRealiseSetting(): Promise<boolean>;
     suspendAllSync(): Promise<boolean>;
     suspendExtraSync(): Promise<boolean>;
-    suggestOptionalFeatures(opt: { enableFetch?: boolean; enableOverwrite?: boolean }): Promise<boolean>;
     enableOptionalFeature(mode: keyof OPTIONAL_SYNC_FEATURES): Promise<boolean>;
 
     clearUsedPassphrase(): void;
@@ -302,11 +470,25 @@ export interface ISettingService {
 
     loadSettings(): Promise<void>;
 
+    getSettingsMigrationState(): SettingsMigrationState | undefined;
+
     getDeviceAndVaultName(): string;
 
     setDeviceAndVaultName(name: string): void;
 
     saveDeviceAndVaultName(): void;
+
+    /**
+     * Read host-provided, device-local configuration by its exact key.
+     * This storage is not part of the synchronised settings document.
+     */
+    getDeviceLocalConfig(key: string): string | null;
+
+    /** Store host-provided, device-local configuration by its exact key. */
+    setDeviceLocalConfig(key: string, value: string): void;
+
+    /** Delete host-provided, device-local configuration by its exact key. */
+    deleteDeviceLocalConfig(key: string): void;
 
     onBeforeSaveSettingData(
         nextSettings: ObsidianLiveSyncSettings,
@@ -335,11 +517,18 @@ export interface ISettingService {
     deleteSmallConfig(key: string): void;
 }
 export interface ITweakValueService {
-    fetchRemotePreferred(trialSetting: RemoteDBSettings): Promise<TweakValues | false>;
+    fetchRemotePreferred(trialSetting: RemoteDBSettings): Promise<RemotePreferredTweakResult>;
 
-    checkAndAskResolvingMismatched(preferred: Partial<TweakValues>): Promise<[TweakValues | boolean, boolean]>;
+    checkAndAskResolvingMismatched(
+        preferred: Partial<TweakValues>,
+        assessment?: TweakAssessment
+    ): Promise<[TweakValues | boolean, boolean]>;
 
-    askResolvingMismatched(preferredSource: TweakValues): Promise<"OK" | "CHECKAGAIN" | "IGNORE">;
+    askResolvingMismatched(
+        preferredSource: TweakValues,
+        updatePreferredRemote?: (setting: ObsidianLiveSyncSettings) => Promise<boolean>,
+        assessment?: TweakAssessment
+    ): Promise<"OK" | "CHECKAGAIN" | "IGNORE">;
 
     checkAndAskUseRemoteConfiguration(
         settings: RemoteDBSettings
@@ -355,11 +544,19 @@ export interface IVaultService {
 
     getVaultName(): string;
 
-    scanVault(showingNotice?: boolean, ignoreSuspending?: boolean): Promise<boolean>;
+    scanVault(
+        showingNotice?: boolean,
+        ignoreSuspending?: boolean,
+        continueOnFileFailure?: boolean
+    ): Promise<VaultScanResult>;
 
     isIgnoredByIgnoreFile(file: string | UXFileInfoStub): Promise<boolean>;
 
-    isTargetFile(file: string | UXFileInfoStub): Promise<boolean>;
+    isTargetFile(
+        file: string | UXFileInfoStub,
+        /** Inspect selection policy without treating a filename collision as an exclusion. */
+        options?: { skipCaseCollisionCheck?: boolean }
+    ): Promise<boolean>;
 
     isTargetFileInExtra(file: string | UXFileInfoStub): Promise<boolean>;
 

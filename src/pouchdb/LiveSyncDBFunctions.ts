@@ -4,14 +4,23 @@ import {
     MILESTONE_DOCID as MILESTONE_DOC_ID,
     type RemoteDBSettings,
     type ChunkVersionRange,
-    TweakValuesShouldMatchedTemplate,
     TweakValuesTemplate,
     type TweakValues,
     DEVICE_ID_PREFERRED,
-    TweakValuesDefault,
     type DeviceInfo,
+    type TweakAssessment,
+    REMOTE_COUCHDB,
 } from "@lib/common/types.ts";
 import { extractObject, isObjectDifferent, resolveWithIgnoreKnownError } from "@lib/common/utils.ts";
+import { assessTweakCompatibility } from "@lib/common/models/tweak.compatibility.ts";
+import { usesEncryptedInternalMetadata } from "./remoteFeatureCompatibility.ts";
+
+export function getEffectiveTweakValues(setting: RemoteDBSettings): TweakValues {
+    return {
+        ...extractObject(TweakValuesTemplate, setting),
+        encryptInternalMetadata: setting.remoteType === REMOTE_COUCHDB && usesEncryptedInternalMetadata(setting),
+    };
+}
 
 // This interface is expected to be unnecessary because of the change in dependency direction
 
@@ -21,6 +30,7 @@ import { extractObject, isObjectDifferent, resolveWithIgnoreKnownError } from "@
 export type ENSURE_DB_RESULT =
     | "OK"
     | "INCOMPATIBLE"
+    | "ID_KEY_MISMATCH"
     | "LOCKED"
     | "NODE_LOCKED"
     | "NODE_CLEANED"
@@ -42,7 +52,8 @@ export async function ensureRemoteIsCompatible(
     deviceNodeID: string,
     currentVersionRange: ChunkVersionRange,
     nodeDeviceInfo: DeviceInfo,
-    updateCallback: (info: EntryMilestoneInfo) => Promise<void>
+    updateCallback: (info: EntryMilestoneInfo) => Promise<void>,
+    recordTweakAssessment?: (assessment: TweakAssessment) => void
 ): Promise<ENSURE_DB_RESULT> {
     const now = Date.now();
     const baseMilestone: EntryMilestoneInfo = {
@@ -64,9 +75,46 @@ export async function ensureRemoteIsCompatible(
     let remoteMilestone = infoSrc;
     if (!remoteMilestone) remoteMilestone = baseMilestone;
 
-    const currentTweakValues = extractObject(TweakValuesTemplate, setting);
+    const currentTweakValues = getEffectiveTweakValues(setting);
+    const nodeChunkInfo = { ...baseMilestone.node_chunk_info, ...remoteMilestone.node_chunk_info };
 
-    remoteMilestone.node_chunk_info = { ...baseMilestone.node_chunk_info, ...remoteMilestone.node_chunk_info };
+    // Check compatibility before publishing this node's settings to the remote milestone.
+    let globalMin = currentVersionRange.min;
+    let globalMax = currentVersionRange.max;
+    for (const nodeId of remoteMilestone.accepted_nodes) {
+        if (nodeId == deviceNodeID) continue;
+        if (nodeId in nodeChunkInfo) {
+            const nodeInfo = nodeChunkInfo[nodeId];
+            globalMin = Math.max(nodeInfo.min, globalMin);
+            globalMax = Math.min(nodeInfo.max, globalMax);
+        } else {
+            globalMin = 0;
+            globalMax = 0;
+        }
+    }
+
+    if (globalMax < globalMin && !setting.ignoreVersionCheck) {
+        return "INCOMPATIBLE";
+    }
+
+    const preferred_tweak = remoteMilestone.tweak_values?.[DEVICE_ID_PREFERRED] ?? currentTweakValues;
+    const tweakAssessment = assessTweakCompatibility(currentTweakValues, preferred_tweak);
+    if (tweakAssessment.entries.some(({ key, relation }) => key === "idDerivationVersion" && relation === "different")) {
+        return "ID_KEY_MISMATCH";
+    }
+
+    if (!setting.disableCheckingConfigMismatch) {
+        recordTweakAssessment?.(tweakAssessment);
+        if (tweakAssessment.alignment === "mismatched") {
+            return ["MISMATCHED", preferred_tweak];
+        }
+    }
+
+    if (remoteMilestone.locked && remoteMilestone.accepted_nodes.indexOf(deviceNodeID) == -1) {
+        return remoteMilestone.cleaned ? "NODE_CLEANED" : "NODE_LOCKED";
+    }
+
+    remoteMilestone.node_chunk_info = nodeChunkInfo;
     let writeMilestone =
         remoteMilestone.node_chunk_info[deviceNodeID].min != currentVersionRange.min ||
         remoteMilestone.node_chunk_info[deviceNodeID].max != currentVersionRange.max ||
@@ -111,62 +159,7 @@ export async function ensureRemoteIsCompatible(
         await updateCallback(remoteMilestone);
     }
 
-    // Check compatibility and make sure available version
-    //
-    // v min of A                  v max of A
-    // |   v  min of B             |   v max of B
-    // |   |                       |   |
-    // |   |<---   We can use  --->|   |
-    // |   |                       |   |
-    // If globalMin and globalMax is suitable, we can upgrade.
-    let globalMin = currentVersionRange.min;
-    let globalMax = currentVersionRange.max;
-    for (const nodeId of remoteMilestone.accepted_nodes) {
-        if (nodeId == deviceNodeID) continue;
-        if (nodeId in remoteMilestone.node_chunk_info) {
-            const nodeInfo = remoteMilestone.node_chunk_info[nodeId];
-            globalMin = Math.max(nodeInfo.min, globalMin);
-            globalMax = Math.min(nodeInfo.max, globalMax);
-        } else {
-            globalMin = 0;
-            globalMax = 0;
-        }
-    }
-
-    if (globalMax < globalMin) {
-        if (!setting.ignoreVersionCheck) {
-            return "INCOMPATIBLE";
-        }
-    }
-
-    if (!setting.disableCheckingConfigMismatch) {
-        // If there is no preferred tweak, set my own as preferred at first.
-        const preferred_tweak = remoteMilestone.tweak_values?.[DEVICE_ID_PREFERRED] ?? currentTweakValues;
-        const current_tweak = currentTweakValues as TweakValues;
-        const preferred_should_matched = extractObject(TweakValuesShouldMatchedTemplate, {
-            ...TweakValuesDefault,
-            ...preferred_tweak,
-        });
-        const current_should_matched = extractObject(TweakValuesShouldMatchedTemplate, {
-            ...TweakValuesDefault,
-            ...current_tweak,
-        });
-        if (isObjectDifferent(preferred_should_matched, current_should_matched, true)) {
-            return ["MISMATCHED", preferred_tweak];
-        }
-    }
-
-    if (remoteMilestone.locked) {
-        if (remoteMilestone.accepted_nodes.indexOf(deviceNodeID) == -1) {
-            if (remoteMilestone.cleaned) {
-                return "NODE_CLEANED";
-            }
-            return "NODE_LOCKED";
-        }
-        return "LOCKED";
-    }
-
-    return "OK";
+    return remoteMilestone.locked ? "LOCKED" : "OK";
 }
 
 export async function ensureDatabaseIsCompatible(
@@ -174,7 +167,8 @@ export async function ensureDatabaseIsCompatible(
     setting: RemoteDBSettings,
     deviceNodeID: string,
     currentVersionRange: ChunkVersionRange,
-    nodeDeviceInfo: DeviceInfo
+    nodeDeviceInfo: DeviceInfo,
+    recordTweakAssessment?: (assessment: TweakAssessment) => void
 ): Promise<ENSURE_DB_RESULT> {
     const remoteMilestone = await resolveWithIgnoreKnownError<EntryMilestoneInfo | false>(
         db.get(MILESTONE_DOC_ID),
@@ -188,7 +182,8 @@ export async function ensureDatabaseIsCompatible(
         nodeDeviceInfo,
         async (info) => {
             await db.put(info);
-        }
+        },
+        recordTweakAssessment
     );
     return ret;
 }

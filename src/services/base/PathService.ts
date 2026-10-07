@@ -4,17 +4,24 @@ import type {
     FilePathWithPrefix,
     FilePath,
     AnyEntry,
+    RemoteDBSettings,
     UXFileInfo,
     UXFileInfoStub,
 } from "@lib/common/types";
 import type { IPathService, ISettingService } from "./IService";
 import { ServiceBase, type ServiceContext } from "./ServiceBase";
-import { addPrefix, id2path_base, path2id_base } from "@lib/string_and_binary/path";
+import { addPrefix, expandFilePathPrefix, id2path_base, path2id_base } from "@lib/string_and_binary/path";
+import { configuredIdKey } from "@lib/common/idDerivation.ts";
 import { isInternalMetadata, stripInternalMetadataPrefix } from "@lib/common/typeUtils";
 import type { BASE_IS_NEW, EVEN, TARGET_IS_NEW } from "@lib/common/models/shared.const.symbols";
 
 export interface PathServiceDependencies {
     settingService: ISettingService;
+    /**
+     * Optional host capability for consumers which keep content encryption and
+     * path-obfuscation passphrases separate.
+     */
+    getPathObfuscationPassphrase?: () => string | false;
 }
 /**
  * The PathService provides methods for converting between file paths and document IDs.
@@ -25,6 +32,7 @@ export abstract class PathService<T extends ServiceContext = ServiceContext>
     implements IPathService
 {
     protected settingService: ISettingService;
+    private readonly getPathObfuscationPassphrase?: () => string | false;
     protected abstract normalizePath(path: string): string;
     get settings() {
         return this.settingService.currentSettings();
@@ -32,28 +40,23 @@ export abstract class PathService<T extends ServiceContext = ServiceContext>
     constructor(context: T, dependencies: PathServiceDependencies) {
         super(context);
         this.settingService = dependencies.settingService;
+        this.getPathObfuscationPassphrase = dependencies.getPathObfuscationPassphrase;
     }
     private _id2path(id: DocumentID, entry?: EntryHasPath): FilePathWithPrefix {
         const filename = id2path_base(id, entry);
-        const temp = filename.split(":");
-        const path = temp.pop();
-        const normalizedPath = this.normalizePath(path as FilePath);
-        temp.push(normalizedPath);
-        const fixedPath = temp.join(":") as FilePathWithPrefix;
-        return fixedPath;
+        const [prefix, path] = expandFilePathPrefix(filename);
+        return (prefix + this.normalizePath(path)) as FilePathWithPrefix;
     }
     private async _path2id(
         filename: FilePathWithPrefix | FilePath,
         obfuscatePassphrase: string | false,
-        caseInsensitive: boolean
+        caseInsensitive: boolean,
+        idDerivationKey?: string
     ): Promise<DocumentID> {
-        const temp = filename.split(":");
-        const path = temp.pop();
-        const normalizedPath = this.normalizePath(path as FilePath);
-        temp.push(normalizedPath);
-        const fixedPath = temp.join(":") as FilePathWithPrefix;
+        const [prefix, path] = expandFilePathPrefix(filename);
+        const fixedPath = (prefix + this.normalizePath(path)) as FilePathWithPrefix;
 
-        const out = await path2id_base(fixedPath, obfuscatePassphrase, caseInsensitive);
+        const out = await path2id_base(fixedPath, obfuscatePassphrase, caseInsensitive, idDerivationKey);
         return out;
     }
     /**
@@ -78,15 +81,31 @@ export abstract class PathService<T extends ServiceContext = ServiceContext>
      * @param prefix The prefix to use for the document ID.
      */
     async path2id(filename: FilePathWithPrefix | FilePath, prefix?: string): Promise<DocumentID> {
+        return this.path2idWithSettings(filename, this.settings, prefix);
+    }
+
+    /** Convert a path using the caller's settings snapshot and this host's path normalisation. */
+    async path2idWithSettings(
+        filename: FilePathWithPrefix | FilePath,
+        setting: Pick<
+            RemoteDBSettings,
+            | "encrypt"
+            | "usePathObfuscation"
+            | "passphrase"
+            | "handleFilenameCaseSensitive"
+            | "idDerivationVersion"
+            | "idDerivationKey"
+        >,
+        prefix?: string
+    ): Promise<DocumentID> {
         const destPath = addPrefix(filename, prefix ?? "");
-        const setting = this.settings;
-        if (!setting) {
-            throw new Error("PathService.path2id: settings not yet initialised — caller must wait for readiness");
-        }
+        const pathObfuscationPassphrase =
+            this.getPathObfuscationPassphrase?.() ?? (setting.usePathObfuscation ? setting.passphrase : false);
         return await this._path2id(
             destPath,
-            setting.usePathObfuscation ? setting.passphrase : "",
-            !setting.handleFilenameCaseSensitive
+            pathObfuscationPassphrase,
+            !setting.handleFilenameCaseSensitive,
+            (setting.encrypt && configuredIdKey(setting)) || undefined
         );
     }
 

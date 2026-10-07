@@ -20,6 +20,9 @@ import {
     isTargetFile,
     prepareChunk,
     putDBEntry,
+    putDBEntryWithLiveBaseRevision,
+    putDBEntryAsIndependentRoot,
+    storeDeletionByPathAtRevision,
 } from "./EntryManagerImpls";
 
 export interface EntryManagerOptions {
@@ -91,23 +94,37 @@ export class EntryManager {
         opt?: PouchDB.Core.GetOptions,
         dump = false,
         waitForReady = true,
-        includeDeleted = false
+        includeDeleted = false,
+        localOnly = false
     ): Promise<false | LoadedEntry> {
-        return await getDBEntryByPath(this.serviceHost, this, path, opt, dump, waitForReady, includeDeleted);
+        return await getDBEntryByPath(this.serviceHost, this, path, opt, dump, waitForReady, includeDeleted, localOnly);
     }
     async getDBEntryFromMeta(
         meta: LoadedEntry | MetaEntry,
         dump = false,
-        waitForReady = true
+        waitForReady = true,
+        localOnly = false
     ): Promise<false | LoadedEntry> {
-        return await getDBEntryFromMeta(this.serviceHost, this, meta, dump, waitForReady);
+        return await getDBEntryFromMeta(this.serviceHost, this, meta, dump, waitForReady, localOnly);
     }
 
     async deleteDBEntry(path: FilePathWithPrefix | FilePath, opt?: PouchDB.Core.GetOptions): Promise<boolean> {
         return await deleteDBEntryByPath(this.serviceHost, this, path, opt);
     }
 
+    async storeDeletionAtRevision(path: FilePathWithPrefix | FilePath, baseRevision: string) {
+        return await storeDeletionByPathAtRevision(this.serviceHost, this, path, baseRevision);
+    }
+
     async putDBEntry(note: SavingEntry, onlyChunks?: boolean, conflictBaseRev?: string) {
         return await putDBEntry(this.serviceHost, this, note, onlyChunks, conflictBaseRev);
+    }
+
+    async putDBEntryWithLiveBaseRevision(note: SavingEntry, baseRevision: string, onlyChunks?: boolean) {
+        return await putDBEntryWithLiveBaseRevision(this.serviceHost, this, note, baseRevision, onlyChunks);
+    }
+    /** Store unknown ancestry as a fresh root; return the Metadata write result or `false`. */
+    async putDBEntryAsIndependentRoot(note: SavingEntry) {
+        return await putDBEntryAsIndependentRoot(this.serviceHost, this, note);
     }
 }

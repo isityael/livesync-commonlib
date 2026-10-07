@@ -2,6 +2,10 @@ import type { JsonLike } from "@lib/rpc";
 import type { P2PSyncSetting, EntryDoc } from "@lib/common/types";
 import type { SimpleStore } from "@lib/common/utils";
 import type { Confirm } from "@lib/interfaces/Confirm";
+import type { AsyncActivityRunner } from "@lib/interfaces/AsyncActivityRunner";
+import type { LiveSyncEventHub } from "@lib/hub/hub";
+import type { MessageTranslator } from "@lib/services/base/MessageTranslator";
+import type { P2PAutomationCoordinator } from "./P2PAutomationCoordinator";
 
 export const DIRECTION_REQUEST = "request";
 export type DIRECTION_REQUEST = typeof DIRECTION_REQUEST;
@@ -95,11 +99,38 @@ export interface ReplicatorHost {
     confirm: Confirm;
 }
 export interface ReplicatorHostEnv extends ReplicatorHost {
+    /** Event channel owned by the containing Commonlib service composition. */
+    events: LiveSyncEventHub;
+    /** Message translation owned by the containing Commonlib service composition. */
+    translate: MessageTranslator;
+    /**
+     * Immutable settings snapshot captured for this room session.
+     *
+     * Room join options, RPC framing, and other session-owned resources must
+     * use this snapshot so one session cannot mix transport generations.
+     */
     settings: P2PSyncSetting;
+    /**
+     * Return the latest host settings for policy evaluated on an open room.
+     *
+     * Older direct consumers may omit this port; they retain snapshot
+     * behaviour through the `settings` fallback.
+     */
+    currentSettings?(): P2PSyncSetting;
     db: PouchDB.Database<EntryDoc>;
     simpleStore: SimpleStore<unknown>;
+    runFiniteReplicationActivity?: AsyncActivityRunner["run"];
+    /** Lightweight, repeatable host policy checked before ordinary P2P replication starts. */
+    canStartOrdinaryReplication?(showMessage?: boolean): Promise<boolean>;
+    /** Stable automatic-transfer state supplied by the owning P2P service. */
+    automationCoordinator?: P2PAutomationCoordinator;
 
     processReplicatedDocs(docs: Array<PouchDB.Core.ExistingDocument<EntryDoc>>): void | Promise<void>;
+}
+
+/** Resolve policy settings without weakening the immutable room snapshot. */
+export function resolveCurrentP2PSettings(env: ReplicatorHostEnv): P2PSyncSetting {
+    return env.currentSettings?.() ?? env.settings;
 }
 
 export type Advertisement = {

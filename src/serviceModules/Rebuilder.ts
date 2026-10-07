@@ -1,5 +1,5 @@
 import { FlagFilesHumanReadable } from "@lib/common/models/redflag.const";
-import { REMOTE_COUCHDB, REMOTE_MINIO } from "@lib/common/models/setting.const";
+import { REMOTE_COUCHDB, REMOTE_MINIO, REMOTE_P2P } from "@lib/common/models/setting.const";
 import { DEFAULT_SETTINGS } from "@lib/common/models/setting.const.defaults";
 import type { IFileHandler } from "@lib/interfaces/FileHandler";
 import type { APIService } from "@lib/services/base/APIService";
@@ -16,16 +16,42 @@ import type { Rebuilder } from "@lib/interfaces/DatabaseRebuilder";
 import type { StorageAccess } from "@lib/interfaces/StorageAccess";
 import { LOG_LEVEL_NOTICE, LOG_LEVEL_VERBOSE } from "octagonal-wheels/common/logger";
 import { delay } from "octagonal-wheels/promises";
-import { eventHub } from "@lib/hub/hub";
+import type { LiveSyncEventHub } from "@lib/hub/hub";
 import { EVENT_DATABASE_REBUILT } from "@lib/events/coreEvents";
 import { ServiceModuleBase } from "@lib/serviceModules/ServiceModuleBase";
 import type { ControlService } from "@lib/services/base/ControlService";
-import { fetchChangesForInitialSync } from "@lib/pouchdb/StreamingFetch";
+import type { IFileProcessingService } from "@lib/services/base/IService";
+import {
+    checkRemoteFeaturesForInitialSync,
+    fetchChangesForInitialSync,
+    isRetryableStreamingFetchFailure,
+} from "@lib/pouchdb/StreamingFetch";
 import { getConfiguredFunctionsForEncryption } from "@lib/pouchdb/encryption";
 import { AuthorizationHeaderGenerator, generateCredentialObject } from "@lib/replication/httplib";
+import { isRemediationModeActive, parseHeaderValues } from "@lib/common/utils";
 import { sizeToHumanReadable } from "octagonal-wheels/number";
+import { REMOTE_RESOURCE_KINDS } from "@lib/replication";
+import type { ReplicatorInstance } from "@lib/replication/ReplicatorInstance.ts";
+
+const FAST_FETCH_CHECKPOINT_KEY = "fast-fetch-checkpoint";
+const FAST_FETCH_RETRY_DELAYS = [2000, 5000, 10000, 20000];
+
+type FastFetchCheckpoint = {
+    remote: string;
+    sequence: number | string;
+};
+
+/** Legacy reset facet used only by the central-remote rebuild workflow. */
+interface CentralRemoteResetter extends ReplicatorInstance {
+    tryResetRemoteDatabase(setting: ReturnType<SettingService["currentSettings"]>): Promise<void>;
+}
+
+function canResetCentralRemote(replicator: ReplicatorInstance): replicator is CentralRemoteResetter {
+    return "tryResetRemoteDatabase" in replicator && typeof replicator.tryResetRemoteDatabase === "function";
+}
 
 export interface ServiceRebuilderDependencies {
+    events: LiveSyncEventHub;
     appLifecycle: AppLifecycleService;
     API: APIService;
     UI: UIService;
@@ -38,10 +64,12 @@ export interface ServiceRebuilderDependencies {
     replication: ReplicationService;
     database: DatabaseService;
     fileHandler: IFileHandler;
+    fileProcessing: IFileProcessingService;
     control: ControlService;
 }
 
 export class ServiceRebuilder extends ServiceModuleBase<ServiceRebuilderDependencies> implements Rebuilder {
+    private events: LiveSyncEventHub;
     private appLifecycle: AppLifecycleService;
     private API: APIService;
     private UI: UIService;
@@ -54,9 +82,11 @@ export class ServiceRebuilder extends ServiceModuleBase<ServiceRebuilderDependen
     private replication: ReplicationService;
     private database: DatabaseService;
     private fileHandler: IFileHandler;
+    private fileProcessing: IFileProcessingService;
     private control: ControlService;
     constructor(services: ServiceRebuilderDependencies) {
         super(services);
+        this.events = services.events;
         this.appLifecycle = services.appLifecycle;
         this.API = services.API;
         this.UI = services.UI;
@@ -69,6 +99,7 @@ export class ServiceRebuilder extends ServiceModuleBase<ServiceRebuilderDependen
         this.replication = services.replication;
         this.database = services.database;
         this.fileHandler = services.fileHandler;
+        this.fileProcessing = services.fileProcessing;
         this.control = services.control;
         services.database.onDatabaseReset.addHandler(this._onResetLocalDatabase.bind(this));
         // services.remote.tryResetDatabase.setHandler(this._tryResetRemoteDatabase.bind(this));
@@ -101,18 +132,14 @@ Please enable them from the settings screen after setup is complete.`,
             ["OK"]
         );
     }
-    async askUsingOptionalFeature(opt: { enableFetch?: boolean; enableOverwrite?: boolean }) {
-        if (
-            (await this.UI.confirm.askYesNoDialog(
-                "Do you want to enable extra features? If you are new to Self-hosted LiveSync, try the core feature first!",
-                { title: "Enable extra features", defaultOption: "No", timeout: 15 }
-            )) == "yes"
-        ) {
-            await this.setting.suggestOptionalFeatures(opt);
-        }
+    async rebuildRemote() {
+        await this.replicator.runBoundedRemoteActivity(() => this.performRemoteRebuild(), {
+            label: "rebuild-remote",
+        });
+        await this.informOptionalFeatures();
     }
 
-    async rebuildRemote() {
+    private async performRemoteRebuild() {
         await this.setting.suspendExtraSync();
         await this.setting.applyPartial({
             isConfigured: true,
@@ -125,18 +152,38 @@ Please enable them from the settings screen after setup is complete.`,
         await this._tryResetRemoteDatabase();
         await this.replication.markLocked();
         await delay(500);
-        // await this.askUsingOptionalFeature({ enableOverwrite: true });
         await delay(1000);
         await this.replication.replicateAllToRemote(true);
         await delay(1000);
-        await this.replication.replicateAllToRemote(true, true);
-        await this.informOptionalFeatures();
+        // The second standard pass predates the removed bulk pre-send path. It converges follow-up
+        // writes and conflict resolutions which the first pass may produce after a remote reset.
+        await this.replication.replicateAllToRemote(true);
     }
     $rebuildRemote(): Promise<void> {
         return this.rebuildRemote();
     }
 
     async rebuildEverything() {
+        await this.replicator.runBoundedRemoteActivity(() => this.performRebuildEverything(), {
+            label: "rebuild-everything",
+        });
+        await this.informOptionalFeatures();
+    }
+
+    private async performRebuildEverything() {
+        if (isRemediationModeActive(this.setting.currentSettings())) {
+            // Rebuilding publishes the current storage as the remote, which is the opposite of
+            // restoring an earlier state. Refuse before the local database is reset.
+            // The caller may report only a generic failure, so state the reason here.
+            this._log(
+                `Rebuilding has been refused: remediation mode is active. Clear the modification-time limit to rebuild.`,
+                LOG_LEVEL_NOTICE
+            );
+            throw new Error(
+                "Rebuilding is not available while remediation mode is active. Clear the modification-time limit first."
+            );
+        }
+        this.appLifecycle.resetIsReady();
         await this.setting.suspendExtraSync();
         // await this.askUseNewAdapter();
         await this.setting.applyPartial({
@@ -146,18 +193,33 @@ Please enable them from the settings screen after setup is complete.`,
         await this.control.applySettings();
         await this.resetLocalDatabase();
         await delay(1000);
-        await this.databaseEvents.initialiseDatabase(true, true, true);
+        await this.prepareLocalDatabaseForRebuild();
+        if (this.setting.currentSettings().remoteType === REMOTE_P2P) {
+            // P2P has no central remote database to lock, reset, or seed. The
+            // first device still needs the same local database initialisation
+            // as other new-user workflows before it can host a peer session.
+            if (!(await this.completePreparedRebuild())) {
+                throw new Error("The local P2P rebuild could not be finalised.");
+            }
+            return;
+        }
         await this.replication.markLocked();
         await this._tryResetRemoteDatabase();
         await this.replication.markLocked();
         await delay(500);
         // We do not have any other devices' data, so we do not need to ask for overwriting.
-        // await this.askUsingOptionalFeature({ enableOverwrite: false });
         await delay(1000);
-        await this.replication.replicateAllToRemote(true);
+        if (!(await this.replication.replicateAllToRemoteForRebuild(true))) {
+            throw new Error("The first rebuild upload did not complete.");
+        }
         await delay(1000);
-        await this.replication.replicateAllToRemote(true, true);
-        await this.informOptionalFeatures();
+        // Preserve the same convergence pass used by a remote-only rebuild.
+        if (!(await this.replication.replicateAllToRemoteForRebuild(true))) {
+            throw new Error("The final rebuild upload did not complete.");
+        }
+        if (!(await this.completePreparedRebuild())) {
+            throw new Error("The rebuild could not be finalised.");
+        }
     }
 
     $rebuildEverything(): Promise<void> {
@@ -172,23 +234,39 @@ Please enable them from the settings screen after setup is complete.`,
         return this.fetchLocalDBFast(autoResume);
     }
 
-    async scheduleRebuild(): Promise<void> {
+    private async scheduleInitialisation(flag: string, prepareBeforeRestart?: () => Promise<void>): Promise<boolean> {
         try {
-            await this.storageAccess.writeFileAuto(FlagFilesHumanReadable.REBUILD_ALL, "");
+            await this.storageAccess.writeFileAuto(flag, "");
         } catch (ex) {
-            this._log(`Could not create ${FlagFilesHumanReadable.REBUILD_ALL}`, LOG_LEVEL_NOTICE);
+            this._log(`Could not create ${flag}`, LOG_LEVEL_NOTICE);
             this._log(ex, LOG_LEVEL_VERBOSE);
+            return false;
         }
+
+        this.appLifecycle.setSuspended(true);
+        try {
+            await prepareBeforeRestart?.();
+        } catch (ex) {
+            try {
+                await this.storageAccess.delete(flag, true);
+            } catch (cleanupError) {
+                this._log(`Could not remove ${flag} after restart preparation failed`, LOG_LEVEL_NOTICE);
+                this._log(cleanupError, LOG_LEVEL_VERBOSE);
+            }
+            this.appLifecycle.setSuspended(false);
+            throw ex;
+        }
+
         this.appLifecycle.performRestart();
+        return true;
     }
-    async scheduleFetch(): Promise<void> {
-        try {
-            await this.storageAccess.writeFileAuto(FlagFilesHumanReadable.FETCH_ALL, "");
-        } catch (ex) {
-            this._log(`Could not create ${FlagFilesHumanReadable.FETCH_ALL}`, LOG_LEVEL_NOTICE);
-            this._log(ex, LOG_LEVEL_VERBOSE);
-        }
-        this.appLifecycle.performRestart();
+
+    scheduleRebuild(prepareBeforeRestart?: () => Promise<void>): Promise<boolean> {
+        return this.scheduleInitialisation(FlagFilesHumanReadable.REBUILD_ALL, prepareBeforeRestart);
+    }
+
+    scheduleFetch(prepareBeforeRestart?: () => Promise<void>): Promise<boolean> {
+        return this.scheduleInitialisation(FlagFilesHumanReadable.FETCH_ALL, prepareBeforeRestart);
     }
 
     private async _tryResetRemoteDatabase(): Promise<void> {
@@ -197,6 +275,9 @@ Please enable them from the settings screen after setup is complete.`,
         if (!currentReplicator) {
             this._log("No active replicator found when trying to reset remote database.", LOG_LEVEL_NOTICE);
             return;
+        }
+        if (!canResetCentralRemote(currentReplicator)) {
+            throw new Error("The active replicator does not support resetting a central remote database.");
         }
         await currentReplicator.tryResetRemoteDatabase(settings);
     }
@@ -242,18 +323,57 @@ Please enable them from the settings screen after setup is complete.`,
         });
         await this.setting.saveSettingData();
     }
-    async resumeReflectingDatabase(ignoreMinIO: boolean = false) {
+    /**
+     * Stage reflection resumption and perform the final reconciliation checks.
+     *
+     * File watching is resumed in memory before the final scan so that changes
+     * made while the scan is running can enter the storage-event queue. This
+     * phase deliberately does not persist the resumed settings. The owning
+     * completion boundary persists them only after the scan, replication
+     * pre-check, and current batch-wait release have succeeded.
+     *
+     * @param ignoreMinIO Whether to resume reflection for a MinIO remote.
+     * @returns `true` when the applicable reconciliation checks succeeded.
+     */
+    async resumeReflectingDatabase(ignoreMinIO: boolean = false): Promise<boolean> {
         const settings = this.setting.currentSettings();
-        if (settings.doNotSuspendOnFetching) return;
-        if (!ignoreMinIO && settings.remoteType == REMOTE_MINIO) return;
+        if (settings.doNotSuspendOnFetching) return true;
+        if (!ignoreMinIO && settings.remoteType == REMOTE_MINIO) return true;
         this._log(`Database and storage reflection has been resumed!`, LOG_LEVEL_NOTICE);
         await this.setting.applyPartial({
             suspendParseReplicationResult: false,
             suspendFileWatching: false,
         });
-        await this.vault.scanVault(true);
-        await this.replication.onBeforeReplicate(false); //TODO: Check actual need of this.
-        await this.setting.saveSettingData();
+        // Remediation mode refuses reconciliation scanning, so requesting a scan can only fail.
+        // The fetched state therefore stays in the local database until the limit is cleared and
+        // an ordinary scan runs; what is applied meanwhile is decided by the host.
+        const inRemediationMode = isRemediationModeActive(this.setting.currentSettings());
+        if (!inRemediationMode && !(await this.vault.scanVault(true))) return false;
+        if (!(await this.replication.onBeforeReplicate(false))) return false;
+        return true;
+    }
+
+    private async prepareLocalDatabaseForRebuild(): Promise<void> {
+        if (!this.database.isDatabaseReady()) {
+            throw new Error("The selected local database is not ready for rebuild preparation.");
+        }
+        if (!(await this.vault.scanVault(true, true))) {
+            throw new Error("The Vault could not be scanned for rebuild preparation.");
+        }
+        if (!(await this.databaseEvents.onDatabaseInitialised(true))) {
+            throw new Error("The local database completion hooks failed during rebuild preparation.");
+        }
+        if (!(await this.fileProcessing.commitPendingFileEvents())) {
+            throw new Error("The current file-event batch could not be released for rebuild preparation.");
+        }
+    }
+
+    private async completePreparedRebuild(): Promise<boolean> {
+        this.appLifecycle.resetIsReady();
+        if (!this.database.isDatabaseReady()) return false;
+        if (!(await this.fileProcessing.commitPendingFileEvents())) return false;
+        this.appLifecycle.markIsReady();
+        return true;
     }
 
     async fetchLocal(makeLocalChunkBeforeSync?: boolean, preventMakeLocalFilesBeforeSync?: boolean, autoResume = true) {
@@ -264,7 +384,7 @@ Please enable them from the settings screen after setup is complete.`,
             notifyThresholdOfRemoteStorageSize: DEFAULT_SETTINGS.notifyThresholdOfRemoteStorageSize,
         });
         const settings = this.setting.currentSettings();
-        if (settings.maxMTimeForReflectEvents > 0) {
+        if (isRemediationModeActive(settings)) {
             const date = new Date(settings.maxMTimeForReflectEvents);
 
             const ask = `Your settings restrict file reflection times to no later than ${date.toLocaleString()}.
@@ -290,31 +410,54 @@ Are you sure you wish to proceed?`;
                 return;
             }
         }
+        await this.replicator.runBoundedRemoteActivity(
+            () => this.performFetchLocal(makeLocalChunkBeforeSync, preventMakeLocalFilesBeforeSync, autoResume),
+            { label: "rebuild-fetch" }
+        );
+    }
+
+    private async performFetchLocal(
+        makeLocalChunkBeforeSync?: boolean,
+        preventMakeLocalFilesBeforeSync?: boolean,
+        autoResume = true
+    ) {
+        this.appLifecycle.resetIsReady();
         // If autoResume is disabled, do not suspend reflection even for Minio.
         await this.suspendReflectingDatabase(!autoResume);
         await this.control.applySettings();
         await this.resetLocalDatabase();
+        this.clearFastFetchCheckpoint();
         await delay(1000);
-        await this.database.openDatabase({
-            databaseEvents: this.databaseEvents,
-            replicator: this.replicator,
-        });
-        // this.core.isReady = true;
-        this.appLifecycle.markIsReady();
-        if (makeLocalChunkBeforeSync) {
+        if (isRemediationModeActive(this.setting.currentSettings())) {
+            // Remediation mode restores an earlier state, so the files in storage are not staged
+            // into the database first; staging them would publish the state being replaced, and
+            // the preparation scan it requires is refused in this mode anyway.
+            this._log(
+                `Remediation mode: the files in storage are not stored in the database before fetching.`,
+                LOG_LEVEL_NOTICE
+            );
+        } else if (makeLocalChunkBeforeSync) {
             await this.fileHandler.createAllChunks(true);
         } else if (!preventMakeLocalFilesBeforeSync) {
-            await this.databaseEvents.initialiseDatabase(true, true, true);
+            await this.prepareLocalDatabaseForRebuild();
         } else {
             // Do not create local file entries before sync (Means use remote information)
         }
         await this.replication.markResolved();
         await delay(500);
-        await this.replication.replicateAllFromRemote(true);
-        await delay(1000);
-        await this.replication.replicateAllFromRemote(true);
+        if (!(await this.replication.replicateAllFromRemoteForRebuild(true))) {
+            throw new Error("The first Standard Fetch pass did not complete.");
+        }
+        if (this.setting.currentSettings().remoteType !== REMOTE_P2P) {
+            await delay(1000);
+            if (!(await this.replication.replicateAllFromRemoteForRebuild(true))) {
+                throw new Error("The final Standard Fetch pass did not complete.");
+            }
+        }
         if (autoResume) {
-            await this.finishRebuild();
+            if (!(await this.finishRebuild())) {
+                throw new Error("Standard Fetch could not be finalised.");
+            }
         }
     }
 
@@ -333,66 +476,181 @@ Are you sure you wish to proceed?`;
             await this.fetchLocal(false, true, autoResume);
             return;
         }
-
-        await this.suspendReflectingDatabase();
-        await this.control.applySettings();
-        await this.resetLocalDatabase();
-        await delay(1000);
-        await this.database.openDatabase({
-            databaseEvents: this.databaseEvents,
-            replicator: this.replicator,
-        });
-        this.appLifecycle.markIsReady();
-
-        const localDB = this.database.localDatabase.localDatabase;
-        const replicator = this.replicator.getActiveReplicator() ?? (await this.replicator.getNewReplicator());
-        if (!replicator) {
-            throw new Error("No active replicator found for fast fetch.");
+        if (settings.useRequestAPI) {
+            this._log(
+                "Fast database fetch is unavailable while 'Use Internal API' is enabled. Falling back to Standard Fetch.",
+                LOG_LEVEL_NOTICE
+            );
+            await this.fetchLocal(false, true, autoResume);
+            return;
         }
-        const salt = () => replicator.getReplicationPBKDF2Salt(settings);
-        const enc = getConfiguredFunctionsForEncryption(
-            settings.passphrase,
-            false,
-            false,
-            salt,
-            settings.E2EEAlgorithm
-        );
 
-        const authHeader = await new AuthorizationHeaderGenerator().getAuthorizationHeader(
-            generateCredentialObject(settings)
-        );
+        await this.replicator.runBoundedRemoteActivity(() => this.performFetchLocalDBFast(settings, autoResume), {
+            label: "fast-fetch",
+        });
+    }
+
+    private async performFetchLocalDBFast(
+        settings: ReturnType<SettingService["currentSettings"]>,
+        autoResume: boolean
+    ) {
         const remote =
             settings.couchDB_URI.replace(/\/+$/, "") +
             (settings.couchDB_DBNAME == "" ? "" : "/" + settings.couchDB_DBNAME);
-
-        await fetchChangesForInitialSync(localDB, remote, authHeader, enc.outgoing, "0", (progress) => {
-            this._log(
-                `Fast fetch progress: ${progress.totalValidFetched} / ${progress.docsToFetch}\nTotal bytes fetched: ${sizeToHumanReadable(progress.totalBytes)}`,
-                LOG_LEVEL_NOTICE,
-                "fetch-init-progress"
-            );
-        });
-
-        const allDocs = await localDB.allDocs({ include_docs: false });
-        this._log(
-            `Fast database fetch completed. Total documents in local database: ${allDocs.total_rows}`,
-            LOG_LEVEL_NOTICE,
-            "fetch-init-complete"
+        const authHeader = await new AuthorizationHeaderGenerator().getAuthorizationHeader(
+            generateCredentialObject(settings)
         );
+        const customHeaders = parseHeaderValues(settings.couchDB_CustomHeaders);
+        await checkRemoteFeaturesForInitialSync(remote, authHeader, customHeaders);
 
-        await this.replication.markResolved();
-        if (autoResume) {
-            await this.resumeReflectingDatabase(true);
+        this.appLifecycle.resetIsReady();
+        let checkpoint = this.getFastFetchCheckpoint(remote);
+
+        await this.suspendReflectingDatabase();
+        await this.control.applySettings();
+        let since = checkpoint?.sequence ?? "0";
+        if (checkpoint) {
+            this._log(
+                `Resuming fast database fetch from sequence: ${checkpoint.sequence}`,
+                LOG_LEVEL_NOTICE,
+                "fetch-init-resume"
+            );
+            if (
+                !(await this.database.openDatabase({
+                    databaseEvents: this.databaseEvents,
+                    replicator: this.replicator,
+                }))
+            ) {
+                throw new Error("The selected local database could not be opened for Fast Fetch.");
+            }
+        } else {
+            await this.resetLocalDatabase();
+            await delay(1000);
+        }
+
+        let localDB = this.database.localDatabase.localDatabase;
+        if (checkpoint && (await localDB.info()).doc_count == 0) {
+            this._log(
+                "Fast fetch checkpoint found, but the local database is empty. Starting from the beginning.",
+                LOG_LEVEL_NOTICE,
+                "fetch-init-resume"
+            );
+            this.clearFastFetchCheckpoint();
+            await this.resetLocalDatabase();
+            await delay(1000);
+            localDB = this.database.localDatabase.localDatabase;
+            since = "0";
+        }
+        const securitySeed = await this.replicator.createRemoteResource(REMOTE_RESOURCE_KINDS.SECURITY_SEED, settings);
+        if (!securitySeed) {
+            throw new Error("The selected provider cannot supply a Security Seed for Fast Fetch.");
+        }
+        try {
+            const enc = getConfiguredFunctionsForEncryption(
+                settings.passphrase,
+                false,
+                false,
+                () => securitySeed.read(),
+                settings.E2EEAlgorithm
+            );
+
+            for (let attempt = 0; ; attempt++) {
+                try {
+                    await fetchChangesForInitialSync(
+                        localDB,
+                        remote,
+                        authHeader,
+                        enc.outgoing,
+                        since,
+                        (progress) => {
+                            this._log(
+                                `Fast fetch progress: ${progress.totalValidFetched} / ${progress.docsToFetch}\nTotal bytes fetched: ${sizeToHumanReadable(progress.totalBytes)}`,
+                                LOG_LEVEL_NOTICE,
+                                "fetch-init-progress"
+                            );
+                        },
+                        (sequence) => this.saveFastFetchCheckpoint(remote, sequence),
+                        customHeaders
+                    );
+                    break;
+                } catch (ex) {
+                    // StreamingFetch owns failure classification. Retrying only its
+                    // explicitly transient transport failures prevents deterministic
+                    // authentication, protocol, decryption, or storage failures from
+                    // consuming the retry budget. Each retry resumes from the latest
+                    // contiguous checkpoint persisted by the previous attempt.
+                    if (!isRetryableStreamingFetchFailure(ex) || attempt >= FAST_FETCH_RETRY_DELAYS.length) throw ex;
+                    checkpoint = this.getFastFetchCheckpoint(remote);
+                    since = checkpoint?.sequence ?? since;
+                    this._log(
+                        `Fast fetch interrupted. Retrying from sequence: ${since}`,
+                        LOG_LEVEL_NOTICE,
+                        "fetch-init-resume"
+                    );
+                    await delay(FAST_FETCH_RETRY_DELAYS[attempt]);
+                }
+            }
+
+            const allDocs = await localDB.allDocs({ include_docs: false });
+            this._log(
+                `Fast database fetch completed. Total documents in local database: ${allDocs.total_rows}`,
+                LOG_LEVEL_NOTICE,
+                "fetch-init-complete"
+            );
+
+            await this.replication.markResolved();
+            if (autoResume) {
+                if (!(await this.finishRebuild())) {
+                    throw new Error("Fast Fetch could not be finalised.");
+                }
+            }
+            this.clearFastFetchCheckpoint();
+        } finally {
+            await securitySeed.dispose();
         }
     }
 
     /**
-     * Finish rebuild process with resuming the reflection.
+     * Complete the final rebuild phases and establish application readiness.
      *
-     * @param ignoreMinIO Whether to ignore minio for resuming the reflection.
+     * A failed completion restores the previous reflection settings in memory.
+     * Persistence atomicity remains a responsibility of the host setting store;
+     * Commonlib cannot roll back a store which writes successfully and then
+     * reports an error.
+     *
+     * @param ignoreMinIO Whether to resume reflection for a MinIO remote.
+     * @returns `true` when finalisation completed; otherwise, `false`.
      */
-    async finishRebuild(ignoreMinIO: boolean = true) {
-        await this.resumeReflectingDatabase(ignoreMinIO);
+    async finishRebuild(ignoreMinIO: boolean = true): Promise<boolean> {
+        this.appLifecycle.resetIsReady();
+        const settings = this.setting.currentSettings();
+        const controlsReflection =
+            !settings.doNotSuspendOnFetching && (ignoreMinIO || settings.remoteType !== REMOTE_MINIO);
+        const previousReflectionState = {
+            suspendParseReplicationResult: settings.suspendParseReplicationResult,
+            suspendFileWatching: settings.suspendFileWatching,
+        };
+        let completed = false;
+        try {
+            if (!this.database.isDatabaseReady()) return false;
+            if (!(await this.resumeReflectingDatabase(ignoreMinIO))) return false;
+            if (!(await this.fileProcessing.commitPendingFileEvents())) return false;
+            if (controlsReflection) {
+                await this.setting.saveSettingData();
+            }
+            // Remediation mode stays restricted after the rebuild: it refuses reconciliation
+            // scanning, so readiness cannot be reported without claiming a scan which never ran.
+            // A host which applies received documents only once ready needs its own allowance.
+            if (!isRemediationModeActive(this.setting.currentSettings())) {
+                this.appLifecycle.markIsReady();
+            }
+            completed = true;
+            return true;
+        } finally {
+            if (!completed && controlsReflection) {
+                await this.setting.applyPartial(previousReflectionState);
+            }
+        }
     }
 
     /**
@@ -411,14 +669,42 @@ Are you sure you wish to proceed?`;
     }
 
     async resetLocalDatabase() {
-        const settings = this.setting.currentSettings();
-        if (settings.isConfigured && settings.additionalSuffixOfDatabaseName == "") {
-            // Discard the non-suffixed database
-            await this.database.resetDatabase();
-        }
         const suffix = this.API.getAppID() || "";
         await this.setting.applyPartial({ additionalSuffixOfDatabaseName: suffix });
-        await this.database.resetDatabase();
-        eventHub.emitEvent(EVENT_DATABASE_REBUILT);
+        const reset = await this.database.resetDatabaseForCurrentSettings({
+            databaseEvents: this.databaseEvents,
+            replicator: this.replicator,
+        });
+        if (!reset) {
+            throw new Error("The local database selected by the current settings could not be reset.");
+        }
+        this.events.emitEvent(EVENT_DATABASE_REBUILT);
+    }
+
+    private getFastFetchCheckpoint(remote: string): FastFetchCheckpoint | undefined {
+        const rawCheckpoint = this.setting.getSmallConfig(FAST_FETCH_CHECKPOINT_KEY);
+        if (!rawCheckpoint) return undefined;
+
+        try {
+            const checkpoint = JSON.parse(rawCheckpoint) as Partial<FastFetchCheckpoint>;
+            if (checkpoint.remote === remote && checkpoint.sequence !== undefined) {
+                return {
+                    remote,
+                    sequence: checkpoint.sequence,
+                };
+            }
+        } catch {
+            // Ignore invalid checkpoints and start cleanly.
+        }
+        this.clearFastFetchCheckpoint();
+        return undefined;
+    }
+
+    private saveFastFetchCheckpoint(remote: string, sequence: number | string) {
+        this.setting.setSmallConfig(FAST_FETCH_CHECKPOINT_KEY, JSON.stringify({ remote, sequence }));
+    }
+
+    private clearFastFetchCheckpoint() {
+        this.setting.deleteSmallConfig(FAST_FETCH_CHECKPOINT_KEY);
     }
 }

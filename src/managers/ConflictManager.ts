@@ -39,6 +39,36 @@ type UserActionRequired = {
     rightLeaf: diff_result_leaf | false;
 };
 
+type ConflictCandidate = {
+    revision: string;
+    leaf: diff_result_leaf | false;
+};
+
+function revisionGeneration(revision: string): number {
+    const generation = Number(revision.split("-", 1)[0]);
+    return Number.isFinite(generation) ? generation : Number.MAX_SAFE_INTEGER;
+}
+
+function compareConflictCandidates(left: ConflictCandidate, right: ConflictCandidate): number {
+    const generationDifference = revisionGeneration(left.revision) - revisionGeneration(right.revision);
+    if (generationDifference !== 0) return generationDifference;
+
+    // A missing modification time is reviewed first. It must not acquire
+    // accidental priority from PouchDB's internal leaf enumeration order.
+    const leftMtime =
+        left.leaf === false || !Number.isFinite(left.leaf.mtime) ? Number.NEGATIVE_INFINITY : left.leaf.mtime;
+    const rightMtime =
+        right.leaf === false || !Number.isFinite(right.leaf.mtime) ? Number.NEGATIVE_INFINITY : right.leaf.mtime;
+    const mtimeDifference = leftMtime - rightMtime;
+    if (mtimeDifference !== 0) return mtimeDifference;
+
+    // Compare the complete revision IDs by code unit so the final tie-breaker
+    // is independent of the host locale.
+    if (left.revision < right.revision) return -1;
+    if (left.revision > right.revision) return 1;
+    return 0;
+}
+
 export type AutoMergeResult = Promise<AutoMergeOutcomeOK | AutoMergeCanBeDoneByDeletingRev | UserActionRequired>;
 
 export interface ConflictManagerOptions {
@@ -158,33 +188,36 @@ export class ConflictManager {
             const rightItem = diffRight[rightIdx] ?? [0, ""];
             leftIdx++;
             rightIdx++;
-            // when completely same, leave it .
+            // Same unchanged line on both sides: keep it once.
             if (leftItem[0] == DIFF_EQUAL && rightItem[0] == DIFF_EQUAL && leftItem[1] == rightItem[1]) {
                 merged.push(leftItem);
                 continue;
             }
             if (leftItem[0] == DIFF_DELETE && rightItem[0] == DIFF_DELETE && leftItem[1] == rightItem[1]) {
-                // when deleted evenly,
+                // Same deletion on both sides is safe. If only one side immediately inserts a replacement,
+                // this is a delete-vs-edit overlap and must remain a manual conflict.
                 const nextLeftIdx = leftIdx;
                 const nextRightIdx = rightIdx;
                 const [nextLeftItem, nextRightItem] = [
                     diffLeft[nextLeftIdx] ?? [0, ""],
                     diffRight[nextRightIdx] ?? [0, ""],
                 ];
-                if (
-                    nextLeftItem[0] == DIFF_INSERT &&
-                    nextRightItem[0] == DIFF_INSERT &&
-                    nextLeftItem[1] != nextRightItem[1]
-                ) {
-                    //but next line looks like different
+                const nextLeftIsInsert = nextLeftItem[0] == DIFF_INSERT;
+                const nextRightIsInsert = nextRightItem[0] == DIFF_INSERT;
+                if (nextLeftIsInsert != nextRightIsInsert) {
                     autoMerge = false;
                     break;
-                } else {
-                    merged.push(leftItem);
-                    continue;
                 }
+                if (nextLeftIsInsert && nextRightIsInsert && nextLeftItem[1] != nextRightItem[1]) {
+                    // Both sides replaced the same deleted line differently.
+                    autoMerge = false;
+                    break;
+                }
+                merged.push(leftItem);
+                continue;
             }
-            // when inserted evenly
+            // Insertions are additive. If both sides inserted different content at the same
+            // position, keep both in a deterministic mtime order.
             if (leftItem[0] == DIFF_INSERT && rightItem[0] == DIFF_INSERT) {
                 if (leftItem[1] == rightItem[1]) {
                     merged.push(leftItem);
@@ -202,7 +235,7 @@ export class ConflictManager {
                     }
                 }
             }
-            // when on inserting, index should be fixed again.
+            // A one-sided insertion does not consume the other side's current line.
             if (leftItem[0] == DIFF_INSERT) {
                 rightIdx--;
                 merged.push(leftItem);
@@ -213,7 +246,8 @@ export class ConflictManager {
                 merged.push(rightItem);
                 continue;
             }
-            // except insertion, the line should not be different.
+            // Apart from insertions, mismatched line contents mean the regions are no
+            // longer aligned enough for a safe automatic merge.
             if (rightItem[1] != leftItem[1]) {
                 //TODO: SHOULD BE PANIC.
                 Logger(
@@ -225,6 +259,8 @@ export class ConflictManager {
             }
             if (leftItem[0] == DIFF_DELETE) {
                 if (rightItem[0] == DIFF_EQUAL) {
+                    // One side deleted a line the other side left unchanged. Prefer the
+                    // deletion; final content generation drops DIFF_DELETE entries.
                     merged.push(leftItem);
                     continue;
                 } else {
@@ -235,6 +271,7 @@ export class ConflictManager {
             }
             if (rightItem[0] == DIFF_DELETE) {
                 if (leftItem[0] == DIFF_EQUAL) {
+                    // Symmetric safe deletion.
                     merged.push(rightItem);
                     continue;
                 } else {
@@ -325,15 +362,28 @@ export class ConflictManager {
     }
     async tryAutoMergeSensibly(path: FilePathWithPrefix, test: LoadedEntry, conflicts: string[]) {
         const conflictedRev = conflicts[0];
-        const conflictedRevNo = Number(conflictedRev.split("-")[0]);
-        //Search
-        const revFrom = await this.database.get<EntryDoc>(await this.options.pathService.path2id(path), {
-            revs_info: true,
-        });
-        const commonBase =
-            (revFrom._revs_info || []).filter(
-                (e) => e.status == "available" && Number(e.rev.split("-")[0]) < conflictedRevNo
-            )?.[0]?.rev ?? "";
+        let commonBase = "";
+        try {
+            const documentId = await this.options.pathService.path2id(path);
+            const [currentBranch, conflictedBranch] = await Promise.all([
+                this.database.get<EntryDoc>(documentId, { rev: test._rev, revs_info: true }),
+                this.database.get<EntryDoc>(documentId, { rev: conflictedRev, revs_info: true }),
+            ]);
+            const currentAvailable = new Set(
+                (currentBranch._revs_info || [])
+                    .filter((revision) => revision.status === "available")
+                    .map((revision) => revision.rev)
+            );
+            commonBase =
+                (conflictedBranch._revs_info || [])
+                    .filter((revision) => revision.status === "available" && currentAvailable.has(revision.rev))
+                    .sort((left, right) => Number(right.rev.split("-")[0]) - Number(left.rev.split("-")[0]))[0]?.rev ??
+                "";
+        } catch (ex) {
+            Logger(`Could not determine the common revision for ${path}`, LOG_LEVEL_VERBOSE);
+            Logger(ex, LOG_LEVEL_VERBOSE);
+            return false;
+        }
         let p = undefined;
         if (commonBase) {
             if (isSensibleMargeApplicable(path)) {
@@ -376,10 +426,19 @@ export class ConflictManager {
         if (test == null) return { ok: MISSING_OR_ERROR };
         if (!test._conflicts) return { ok: NOT_CONFLICTED };
         if (test._conflicts.length == 0) return { ok: NOT_CONFLICTED };
-        const conflicts = test._conflicts.sort((a, b) => Number(a.split("-")[0]) - Number(b.split("-")[0]));
+        const conflictCandidates = await Promise.all(
+            test._conflicts.map(
+                async (revision): Promise<ConflictCandidate> => ({
+                    revision,
+                    leaf: await this.getConflictedDoc(path, revision),
+                })
+            )
+        );
+        conflictCandidates.sort(compareConflictCandidates);
+        const conflicts = conflictCandidates.map(({ revision }) => revision);
         // Resolve identical conflict leaves without creating a new revision.
         const leftLeaf = await this.getConflictedDoc(path, test._rev!);
-        const rightLeaf = await this.getConflictedDoc(path, conflicts[0]);
+        const rightLeaf = conflictCandidates[0].leaf;
         if (
             leftLeaf !== false &&
             rightLeaf !== false &&

@@ -1,26 +1,55 @@
-import { Logger, LOG_LEVEL_VERBOSE } from "octagonal-wheels/common/logger";
-import { AutoAccepting, REMOTE_P2P, type ObsidianLiveSyncSettings } from "@lib/common/types";
+import { AutoAccepting, REMOTE_P2P } from "@lib/common/types";
 import type { NecessaryServices } from "@lib/interfaces/ServiceModule";
-import { LiveSyncTrysteroReplicator } from "./LiveSyncTrysteroReplicator";
+import type { LiveSyncTrysteroReplicator } from "./LiveSyncTrysteroReplicator";
 import { type UseP2PReplicatorResult } from "./UseP2PReplicatorResult";
 import { addP2PEventHandlers } from "./addP2PEventHandlers";
-import { compatGlobal } from "@lib/common/coreEnvFunctions";
+import { createP2PService, type P2PServiceViews } from "@lib/p2p/P2PService";
+import {
+    CAPABILITY_NOT_APPLICABLE,
+    NO_REMOTE_RESOURCE_CAPABILITIES,
+    PEER_REPLICATION_READINESS,
+    REPLICATION_PROGRESS_PRESENTATIONS,
+    defineReplicatorProviderDefinitions,
+    outcomeFromFiniteOpenReplication,
+    replicationBlocked,
+    replicationFailed,
+    supportedCapability,
+    supportedStopActiveTransfer,
+    type UserInitiatedOneShotRunner,
+    type UnattendedOneShotRunner,
+} from "@lib/replication";
+import { getP2PReplicatorConfigurationIdentity } from "./p2pReplicatorConfigurationIdentity.ts";
+import type { PrepareP2PSettings } from "@lib/p2p/P2PService.ts";
 
 /**
- * Factory type: given a replicator instance, returns the openReplicationUI callback for that instance.
- * Injected by the host platform (e.g. Obsidian). CLI/headless environments omit this.
+ * Factory type: given the compatibility Replicator and the stable service
+ * views, returns the openReplicationUI callback for that instance.
+ *
+ * The Replicator remains available for rebuild-specific compatibility work;
+ * modal lifecycle, status, and ordinary actions should use the narrow views.
+ * Injected by the host platform (for example, Obsidian). CLI and headless
+ * environments omit this.
  */
 export type OpenReplicationUIFactory = (
-    replicator: LiveSyncTrysteroReplicator
+    replicator: LiveSyncTrysteroReplicator,
+    p2p: P2PServiceViews
 ) => (showResult: boolean) => Promise<boolean | void>;
 
 /** Same shape as OpenReplicationUIFactory, used for the rebuild/replicateAllFromServer flow. */
 export type OpenRebuildUIFactory = OpenReplicationUIFactory;
 
+/** Optional host integrations for the P2P room lifecycle. */
+export interface P2PReplicatorFeatureOptions {
+    readonly prepareP2PSettings?: PrepareP2PSettings;
+}
+
 /**
- * ServiceFeature: P2P Replicator integration and lifecycle management.
- * Registers a LiveSyncTrysteroReplicator instance as the active replicator when P2P is enabled in settings,
- * and binds it to lifecycle events for proper initialization and cleanup.
+ * Compose one private P2P service context and register non-owning active
+ * provider adapters over it.
+ *
+ * The returned views remain valid for the host composition lifetime. The
+ * compatibility facade is retained only for consumers which have not yet
+ * migrated to those views.
  * @param host
  */
 
@@ -41,72 +70,97 @@ export function useP2PReplicatorFeature(
         never
     >,
     openReplicationUIFactory?: OpenReplicationUIFactory,
-    openRebuildUIFactory?: OpenRebuildUIFactory
+    openRebuildUIFactory?: OpenRebuildUIFactory,
+    options: P2PReplicatorFeatureOptions = {}
 ): UseP2PReplicatorResult {
-    // Replicator instance should be single and shared across the plug-in.
-    let replicator: LiveSyncTrysteroReplicator = new LiveSyncTrysteroReplicator({
-        services: host.services,
-    });
-    if (openReplicationUIFactory) {
-        replicator.env.openReplicationUI = openReplicationUIFactory(replicator);
-    }
-    if (openRebuildUIFactory) {
-        replicator.env.openRebuildUI = openRebuildUIFactory(replicator);
-    }
-    const activeReplicator = {
-        get replicator() {
-            return replicator;
+    const service = createP2PService(
+        {
+            services: host.services,
         },
-    };
-    addP2PEventHandlers(activeReplicator.replicator);
-    host.services.replicator.getNewReplicator.addHandler(
-        async (settingOverride: Partial<ObsidianLiveSyncSettings> = {}) => {
-            const settings = { ...host.services.setting.currentSettings(), ...settingOverride };
-            if (settings.remoteType == REMOTE_P2P) {
-                const existingReplicator = replicator;
-                try {
-                    await existingReplicator?.close();
-                } catch (e) {
-                    Logger(`Error closing existing p2p replicator`);
-                    Logger(e, LOG_LEVEL_VERBOSE);
-                }
-                const newReplicator = new LiveSyncTrysteroReplicator({ services: host.services });
-                if (openReplicationUIFactory) {
-                    newReplicator.env.openReplicationUI = openReplicationUIFactory(newReplicator);
-                }
-                if (openRebuildUIFactory) {
-                    newReplicator.env.openRebuildUI = openRebuildUIFactory(newReplicator);
-                }
-                replicator = newReplicator; // Update the replicator reference for lifecycle handlers
-                return replicator;
-            }
-            return undefined!;
-        }
+        options
     );
+    const replicator = service.compatibilityReplicator;
+    const { views, lifecycle } = service;
+
+    const configureReplicator = (instance: LiveSyncTrysteroReplicator) => {
+        if (openReplicationUIFactory) {
+            instance.env.openReplicationUI = openReplicationUIFactory(instance, views);
+        }
+        if (openRebuildUIFactory) {
+            instance.env.openRebuildUI = openRebuildUIFactory(instance, views);
+        }
+    };
+    configureReplicator(replicator);
+
+    const createP2PReplicator = async () => service.createActiveReplicator();
+
+    const userInitiatedOneShot: UserInitiatedOneShotRunner = async (instance, setting, request) => {
+        if (request.interaction.kind !== "permitted" || !request.interaction.permissions.peerSelection) {
+            return replicationBlocked("interaction-required");
+        }
+        try {
+            const result = await instance.openReplication(
+                setting,
+                false,
+                request.progressPresentation === REPLICATION_PROGRESS_PRESENTATIONS.NOTICE,
+                false
+            );
+            return outcomeFromFiniteOpenReplication(result);
+        } catch (error) {
+            return replicationFailed(error);
+        }
+    };
+    const unattendedOneShot: UnattendedOneShotRunner = async (_instance, _setting, request) => {
+        if (request.interaction.kind !== "forbidden") {
+            return replicationBlocked("interaction-required");
+        }
+        return await views.targetedTransfer.synchroniseConfiguredTargets();
+    };
+
+    host.services.replicator.registerReplicatorProviderDefinitions(
+        defineReplicatorProviderDefinitions([REMOTE_P2P] as const, {
+            [REMOTE_P2P]: {
+                kind: REMOTE_P2P,
+                diagnosticName: "P2P",
+                readiness: PEER_REPLICATION_READINESS,
+                isConfigured: (settings) => settings.remoteType === REMOTE_P2P && settings.P2P_Enabled,
+                configurationIdentity: getP2PReplicatorConfigurationIdentity,
+                create: createP2PReplicator,
+                remoteResources: NO_REMOTE_RESOURCE_CAPABILITIES,
+                userInitiatedOneShot: supportedCapability(userInitiatedOneShot),
+                unattendedOneShot: supportedCapability(unattendedOneShot),
+                continuous: CAPABILITY_NOT_APPLICABLE,
+                stopActiveTransfer: supportedStopActiveTransfer(),
+            },
+        })
+    );
+
+    const activeReplicator: UseP2PReplicatorResult = { replicator, ...views };
+    addP2PEventHandlers(lifecycle, host.services.context.events);
 
     // Lifecycle bindings (replication should be closed).
 
     host.services.appLifecycle.onUnload.addHandler(async () => {
-        await replicator?.close();
+        await lifecycle.closeForLifecycle();
         return true;
     });
 
     host.services.appLifecycle.onSuspending.addHandler(async () => {
-        await replicator?.close();
+        await lifecycle.closeForLifecycle();
         return true;
     });
 
-    host.services.databaseEvents.onDatabaseInitialisation.addHandler(async () => {
-        await replicator?.close();
+    const closeForDatabaseLifecycle = async () => {
+        await lifecycle.closeForLifecycle();
         return true;
-    });
+    };
+    host.services.databaseEvents.onResetDatabase.addHandler(closeForDatabaseLifecycle);
+    host.services.databaseEvents.onCloseDatabase.addHandler(closeForDatabaseLifecycle);
+    host.services.databaseEvents.onDatabaseInitialisation.addHandler(closeForDatabaseLifecycle);
 
     // And, reopen if auto-start is enabled when app is resumed.
     host.services.appLifecycle.onResumed.addHandler(() => {
-        const settings = host.services.setting.currentSettings();
-        if (settings.P2P_Enabled && settings.P2P_AutoStart) {
-            compatGlobal.setTimeout(() => void replicator?.open(), 100);
-        }
+        lifecycle.scheduleAutoStart();
         return Promise.resolve(true);
     });
 

@@ -1,0 +1,31 @@
+name: livesync-commonlib-integration
+
+services:
+  couchdb:
+    image: couchdb:3.5.0
+    environment:
+      COUCHDB_USER: admin
+      COUCHDB_PASSWORD: testpassword
+    ports:
+      - "5989:5984"
+
+  minio:
+    image: rustfs/rustfs:1.0.0-rc.6@sha256:97171b3d72cd47dc81000f92ea84de25608bfc35a94c965501afaeb5d99f6035
+    command: /data
+    environment:
+      RUSTFS_ACCESS_KEY: minioadmin
+      RUSTFS_SECRET_KEY: minioadmin
+    ports:
+      - "9000:9000"
+
+  minio-init:
+    image: rustfs/rc:v0.1.35@sha256:adb45b56539006120f1d790bcc17ee5f9b4d93c1d7e71ed0a24f10267f9d6914
+    depends_on:
+      - minio
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        rc alias set integration http://minio:9000 minioadmin minioadmin
+        rc mb --ignore-existing integration/livesync-test-bucket

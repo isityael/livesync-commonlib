@@ -1,15 +1,15 @@
 import {
     ChunkAlgorithmNames,
-    DEFAULT_SETTINGS,
     LOG_LEVEL_NOTICE,
     LOG_LEVEL_URGENT,
     LOG_LEVEL_VERBOSE,
     SALT_OF_PASSPHRASE,
     SETTING_KEY_P2P_DEVICE_NAME,
-    type BucketSyncSetting,
+    omitP2PRuntimeSettings,
+    prepareSettingsForLoad,
     type ConfigPassphraseStore,
-    type CouchDBConnection,
     type ObsidianLiveSyncSettings,
+    type SettingsMigrationState,
 } from "@lib/common/types";
 import { handlers } from "@lib/services/lib/HandlerUtils";
 import type { IAPIService, ISettingService } from "./IService";
@@ -17,7 +17,7 @@ import { ServiceBase, type ServiceContext } from "./ServiceBase";
 import { createInstanceLogFunction } from "@lib/services/lib/logUtils";
 import { isCloudantURI } from "@lib/pouchdb/utils_couchdb";
 import { decryptString, encryptString } from "@lib/encryption/stringEncryption";
-import { setLang } from "@lib/common/i18n";
+import { encryptWithEphemeralSalt } from "octagonal-wheels/encryption/hkdf";
 import {
     activateP2PRemoteConfiguration,
     activateRemoteConfiguration,
@@ -25,9 +25,22 @@ import {
     migrateP2PActiveRemoteConfigurationIdInPlace,
 } from "@lib/serviceFeatures/remoteConfig";
 import { ConnectionStringParser } from "@lib/common/ConnectionString";
+import { configuredIdKey } from "@lib/common/idDerivation";
+import {
+    clearConnectionSettings,
+    hasConnectionSettings,
+    omitUnpersistedSettings,
+    prepareSettingsForPersistence,
+    requireConfigurationCiphertext,
+    restoreConnectionSettings,
+    selectConnectionSettings,
+    type PersistedSettings,
+} from "@lib/common/models/setting.policy";
 
 export interface SettingServiceDependencies {
     APIService: IAPIService;
+    /** Optional host hook for applying the loaded display language to its catalogue. */
+    onDisplayLanguageChanged?: (language: ObsidianLiveSyncSettings["displayLanguage"]) => void;
 }
 export abstract class SettingService<T extends ServiceContext = ServiceContext>
     extends ServiceBase<T>
@@ -35,6 +48,7 @@ export abstract class SettingService<T extends ServiceContext = ServiceContext>
 {
     deviceAndVaultName: string = "";
     protected APIService: IAPIService;
+    private readonly onDisplayLanguageChanged?: SettingServiceDependencies["onDisplayLanguageChanged"];
 
     protected abstract setItem(key: string, value: string): void;
     protected abstract getItem(key: string): string;
@@ -50,17 +64,23 @@ export abstract class SettingService<T extends ServiceContext = ServiceContext>
     }
 
     // Save setting to the runtime storage.
-    protected abstract saveData(setting: ObsidianLiveSyncSettings): Promise<void>;
+    protected abstract saveData(setting: PersistedSettings): Promise<void>;
 
     // Load setting from the runtime storage.
     protected abstract loadData(): Promise<ObsidianLiveSyncSettings | undefined>;
 
     private _lastPersistedSettings?: ObsidianLiveSyncSettings;
+    private _settingsMigrationState?: SettingsMigrationState;
+
+    getSettingsMigrationState(): SettingsMigrationState | undefined {
+        return this._settingsMigrationState;
+    }
 
     _log: ReturnType<typeof createInstanceLogFunction>;
     constructor(context: T, dependencies: SettingServiceDependencies) {
         super(context);
         this.APIService = dependencies.APIService;
+        this.onDisplayLanguageChanged = dependencies.onDisplayLanguageChanged;
         this._log = createInstanceLogFunction("SettingService", this.APIService);
     }
 
@@ -133,7 +153,27 @@ export abstract class SettingService<T extends ServiceContext = ServiceContext>
             "obsidian-live-sync-vaultanddevicename-" +
             this.APIService.getSystemVaultName() +
             this.additionalSuffixOfDatabaseName();
-        this.setItem(lsKey, this.deviceAndVaultName);
+        this.setDeviceLocalConfig(lsKey, this.deviceAndVaultName);
+    }
+
+    /**
+     * Read an exact key from the host's device-local configuration store.
+     *
+     * Unlike the main settings document, this state is not synchronised. Callers
+     * which need Vault namespacing should normally use {@link getSmallConfig}.
+     */
+    getDeviceLocalConfig(key: string): string | null {
+        return this.getItem(key);
+    }
+
+    /** Store an exact key in the host's non-synchronised configuration store. */
+    setDeviceLocalConfig(key: string, value: string): void {
+        this.setItem(key, value);
+    }
+
+    /** Delete an exact key from the host's non-synchronised configuration store. */
+    deleteDeviceLocalConfig(key: string): void {
+        this.deleteItem(key);
     }
 
     private additionalSuffixOfDatabaseName() {
@@ -152,15 +192,15 @@ export abstract class SettingService<T extends ServiceContext = ServiceContext>
 
     setSmallConfig(key: string, value: string): void {
         const dbKey = this.getKey(key);
-        this.setItem(dbKey, value);
+        this.setDeviceLocalConfig(dbKey, value);
     }
     getSmallConfig(key: string): string {
         const dbKey = this.getKey(key);
-        return this.getItem(dbKey);
+        return this.getDeviceLocalConfig(dbKey) ?? "";
     }
     deleteSmallConfig(key: string): void {
         const dbKey = this.getKey(key);
-        this.deleteItem(dbKey);
+        this.deleteDeviceLocalConfig(dbKey);
     }
 
     /**
@@ -169,17 +209,38 @@ export abstract class SettingService<T extends ServiceContext = ServiceContext>
     async saveSettingData() {
         this.saveDeviceAndVaultName();
         const previousSettings = this._lastPersistedSettings ?? this.cloneSettings(this.settings);
-        const settings = {
-            ...this.settings,
-            remoteConfigurations: Object.fromEntries(
-                Object.entries(this.settings.remoteConfigurations || {}).map(([id, config]) => [id, { ...config }])
-            ),
-        };
+        const settings = this.cloneSettings(this.settings);
         const hookResults = await this.onBeforeSaveSettingData(settings, previousSettings);
         for (const patch of hookResults) {
             if (patch instanceof Error || !patch) continue;
             Object.assign(settings, patch);
             Object.assign(this.settings, patch);
+        }
+        const idKey = configuredIdKey(settings);
+        if (settings.idDerivationVersion === 1) {
+            if (idKey === false) {
+                throw new Error("The configured ID derivation key is unavailable.");
+            }
+            let passphrase: string | false = this.usedPassphrase;
+            if (passphrase === "") {
+                passphrase = await this.getPassphrase(settings);
+            }
+            if (passphrase === false || passphrase === "") {
+                const message = "Failed to retrieve a passphrase for the ID derivation key. Settings were not saved.";
+                this._log(message, LOG_LEVEL_URGENT);
+                throw new Error(message);
+            }
+            const encryptedIdKey = await encryptString(idKey, passphrase + SALT_OF_PASSPHRASE);
+            if (encryptedIdKey === "") {
+                const message = "Failed to encrypt the ID derivation key. Settings were not saved.";
+                this._log(message, LOG_LEVEL_URGENT);
+                throw new Error(message);
+            }
+            settings.encryptedIdDerivationKey = encryptedIdKey;
+            settings.idDerivationKey = "";
+            this.usedPassphrase = passphrase;
+        } else {
+            settings.encryptedIdDerivationKey = "";
         }
         settings.deviceAndVaultName = "";
         if (settings.P2P_DevicePeerName && settings.P2P_DevicePeerName.trim() !== "") {
@@ -187,59 +248,53 @@ export abstract class SettingService<T extends ServiceContext = ServiceContext>
             this.setSmallConfig(SETTING_KEY_P2P_DEVICE_NAME, settings.P2P_DevicePeerName.trim());
             settings.P2P_DevicePeerName = "";
         }
-        if (this.usedPassphrase == "" && !(await this.getPassphrase(settings))) {
+        omitUnpersistedSettings(settings);
+        const configurationPassphrase = this.usedPassphrase || (await this.getPassphrase(settings));
+        if (!configurationPassphrase) {
+            if (
+                Object.values(settings.remoteConfigurations).some((config) => this.hasManagedP2PProfileURI(config.uri))
+            ) {
+                const message = "Failed to retrieve a passphrase for managed P2P source data. Settings were not saved.";
+                this._log(message, LOG_LEVEL_URGENT);
+                throw new Error(message);
+            }
+            if (
+                hasConnectionSettings(settings) ||
+                (settings.encrypt && settings.passphrase !== "") ||
+                (settings.configPassphraseStore !== "" &&
+                    Object.values(settings.remoteConfigurations).some(
+                        (config) => !config.isEncrypted && config.uri.trim() !== ""
+                    ))
+            ) {
+                const message = "Failed to retrieve a configuration passphrase. Settings were not saved.";
+                this._log(message, LOG_LEVEL_URGENT);
+                throw new Error(message);
+            }
             this._log("Failed to retrieve passphrase. data.json contains unencrypted items!", LOG_LEVEL_NOTICE);
         } else {
-            if (
-                settings.couchDB_PASSWORD != "" ||
-                settings.couchDB_URI != "" ||
-                settings.couchDB_USER != "" ||
-                settings.couchDB_DBNAME
-            ) {
-                const connectionSetting: CouchDBConnection & BucketSyncSetting = {
-                    couchDB_DBNAME: settings.couchDB_DBNAME,
-                    couchDB_PASSWORD: settings.couchDB_PASSWORD,
-                    couchDB_URI: settings.couchDB_URI,
-                    couchDB_USER: settings.couchDB_USER,
-                    accessKey: settings.accessKey,
-                    bucket: settings.bucket,
-                    endpoint: settings.endpoint,
-                    region: settings.region,
-                    secretKey: settings.secretKey,
-                    useCustomRequestHandler: settings.useCustomRequestHandler,
-                    bucketCustomHeaders: settings.bucketCustomHeaders,
-                    couchDB_CustomHeaders: settings.couchDB_CustomHeaders,
-                    useJWT: settings.useJWT,
-                    jwtKey: settings.jwtKey,
-                    jwtAlgorithm: settings.jwtAlgorithm,
-                    jwtKid: settings.jwtKid,
-                    jwtExpDuration: settings.jwtExpDuration,
-                    jwtSub: settings.jwtSub,
-                    useRequestAPI: settings.useRequestAPI,
-                    bucketPrefix: settings.bucketPrefix,
-                    forcePathStyle: settings.forcePathStyle,
-                };
-                settings.encryptedCouchDBConnection = await this.encryptConfigurationItem(
-                    JSON.stringify(connectionSetting),
-                    settings
+            if (hasConnectionSettings(settings)) {
+                settings.encryptedCouchDBConnection = requireConfigurationCiphertext(
+                    await this.encryptConfigurationItem(JSON.stringify(selectConnectionSettings(settings)), settings)
                 );
-                settings.couchDB_PASSWORD = "";
-                settings.couchDB_DBNAME = "";
-                settings.couchDB_URI = "";
-                settings.couchDB_USER = "";
-                settings.accessKey = "";
-                settings.bucket = "";
-                settings.region = "";
-                settings.secretKey = "";
-                settings.endpoint = "";
+                clearConnectionSettings(settings);
+            } else if (settings.encryptedCouchDBConnection) {
+                const existingConnection = this.tryDecodeJson(
+                    await this.decryptConfigurationItem(settings.encryptedCouchDBConnection, configurationPassphrase)
+                );
+                if (restoreConnectionSettings(this.cloneSettings(settings), existingConnection)) {
+                    settings.encryptedCouchDBConnection = "";
+                }
             }
             if (settings.encrypt && settings.passphrase != "") {
-                settings.encryptedPassphrase = await this.encryptConfigurationItem(settings.passphrase, settings);
+                settings.encryptedPassphrase = requireConfigurationCiphertext(
+                    await this.encryptPlainConfigurationItem(settings.passphrase, settings)
+                );
                 settings.passphrase = "";
             }
             await this.encryptRemoteConfigurationUris(settings);
         }
-        await this.saveData(settings);
+        const persisted = prepareSettingsForPersistence(settings);
+        await this.saveData(persisted);
         this._lastPersistedSettings = this.cloneSettings(this.settings);
         void this.onSettingSaved(settings);
     }
@@ -250,8 +305,29 @@ export abstract class SettingService<T extends ServiceContext = ServiceContext>
             if (config.isEncrypted || config.uri.trim() === "") {
                 continue;
             }
-            const encryptedURI = await this.encryptConfigurationItem(config.uri, settings);
+            const managedP2PProfile = this.hasManagedP2PProfileURI(config.uri);
+            let encryptedURI: string;
+            try {
+                encryptedURI = await this.encryptConfigurationItem(config.uri, settings);
+            } catch (error) {
+                if (managedP2PProfile) {
+                    const message = `Failed to encrypt managed P2P remote configuration '${id}'. Settings were not saved.`;
+                    this._log(message, LOG_LEVEL_URGENT);
+                    throw new Error(message);
+                }
+                throw error;
+            }
             if (encryptedURI === "") {
+                if (managedP2PProfile) {
+                    const message = `Failed to encrypt managed P2P remote configuration '${id}'. Settings were not saved.`;
+                    this._log(message, LOG_LEVEL_URGENT);
+                    throw new Error(message);
+                }
+                if (settings.configPassphraseStore !== "") {
+                    const message = `Failed to encrypt remote configuration '${id}'. Settings were not saved.`;
+                    this._log(message, LOG_LEVEL_URGENT);
+                    throw new Error(message);
+                }
                 this._log(
                     `Failed to encrypt remote configuration '${id}'. This entry will be saved in plain text.`,
                     LOG_LEVEL_URGENT
@@ -264,6 +340,15 @@ export abstract class SettingService<T extends ServiceContext = ServiceContext>
                 isEncrypted: true,
             };
         }
+    }
+
+    private hasManagedP2PProfileURI(uri: string): boolean {
+        const trimmed = uri.trim();
+        if (!trimmed.startsWith("sls+p2p://")) return false;
+        const queryStart = trimmed.indexOf("?");
+        if (queryStart < 0) return false;
+        const query = trimmed.slice(queryStart + 1).split("#", 1)[0];
+        return (new URLSearchParams(query).get("managedType") ?? "").trim().length > 0;
     }
 
     private async decryptRemoteConfigurationUris(
@@ -332,13 +417,7 @@ export abstract class SettingService<T extends ServiceContext = ServiceContext>
     readonly suspendExtraSync = handlers<ISettingService>().all("suspendExtraSync");
 
     /**
-     * Suggest enabling optional features to the user.
-     */
-    readonly suggestOptionalFeatures = handlers<ISettingService>().all("suggestOptionalFeatures");
-
-    /**
      * Enable an optional feature and save to the settings.
-     * It may also raised from `handleSuggestOptionalFeatures` if the user agrees.
      * @param mode The optional feature to enable.
      */
     readonly enableOptionalFeature = handlers<ISettingService>().all("enableOptionalFeature");
@@ -375,7 +454,7 @@ export abstract class SettingService<T extends ServiceContext = ServiceContext>
         try {
             this.settings = await this.adjustSettings({
                 ...this.settings,
-                ...partial,
+                ...omitP2PRuntimeSettings(partial),
             });
         } catch (ex) {
             this._log("Error in applying external settings: ", LOG_LEVEL_URGENT);
@@ -403,7 +482,7 @@ export abstract class SettingService<T extends ServiceContext = ServiceContext>
     getPassphrase(settings: ObsidianLiveSyncSettings) {
         const methods: Record<ConfigPassphraseStore, () => Promise<string | false>> = {
             "": () => Promise.resolve("*"),
-            LOCALSTORAGE: () => Promise.resolve(this.getItem("ls-setting-passphrase") ?? false),
+            LOCALSTORAGE: () => Promise.resolve(this.getDeviceLocalConfig("ls-setting-passphrase") ?? false),
             ASK_AT_LAUNCH: () => this.APIService.confirm.askString("Passphrase", "passphrase", ""),
         };
         const method = settings.configPassphraseStore;
@@ -433,8 +512,18 @@ export abstract class SettingService<T extends ServiceContext = ServiceContext>
         return false;
     }
     async encryptConfigurationItem(src: string, settings: ObsidianLiveSyncSettings) {
+        return this.encryptConfigurationItemWith(src, settings, encryptString);
+    }
+    private async encryptPlainConfigurationItem(src: string, settings: ObsidianLiveSyncSettings) {
+        return this.encryptConfigurationItemWith(src, settings, encryptWithEphemeralSalt);
+    }
+    private async encryptConfigurationItemWith(
+        src: string,
+        settings: ObsidianLiveSyncSettings,
+        encrypt: (source: string, passphrase: string) => Promise<string>
+    ) {
         if (this.usedPassphrase != "") {
-            return await encryptString(src, this.usedPassphrase + SALT_OF_PASSPHRASE);
+            return await encrypt(src, this.usedPassphrase + SALT_OF_PASSPHRASE);
         }
 
         const passphrase = await this.getPassphrase(settings);
@@ -445,7 +534,7 @@ export abstract class SettingService<T extends ServiceContext = ServiceContext>
             );
             return "";
         }
-        const dec = await encryptString(src, passphrase + SALT_OF_PASSPHRASE);
+        const dec = await encrypt(src, passphrase + SALT_OF_PASSPHRASE);
         if (dec) {
             this.usedPassphrase = passphrase;
             return dec;
@@ -459,7 +548,27 @@ export abstract class SettingService<T extends ServiceContext = ServiceContext>
      * @param settings The settings to decrypt.
      */
     async decryptSettings(settings: ObsidianLiveSyncSettings): Promise<ObsidianLiveSyncSettings> {
+        if (settings.idDerivationVersion !== 1) {
+            configuredIdKey(settings);
+        } else if (!settings.encryptedIdDerivationKey) {
+            throw new Error("The configured ID derivation key is missing or unavailable.");
+        }
         const passphrase = await this.getPassphrase(settings);
+        if (settings.idDerivationVersion === 1) {
+            if (passphrase === false || passphrase === "") {
+                throw new Error("The configured ID derivation key cannot be decrypted without a passphrase.");
+            }
+            const decryptedIdKey = await this.decryptConfigurationItem(settings.encryptedIdDerivationKey, passphrase);
+            if (decryptedIdKey === false) {
+                throw new Error("The configured ID derivation key could not be decrypted.");
+            }
+            try {
+                configuredIdKey({ ...settings, idDerivationKey: decryptedIdKey });
+            } catch {
+                throw new Error("The configured ID derivation key is invalid.");
+            }
+            settings.idDerivationKey = decryptedIdKey;
+        }
         if (passphrase === false) {
             this._log("No passphrase found for data.json! Verify configuration before syncing.", LOG_LEVEL_URGENT);
             const hasEncryptedRemoteConfigurations = Object.values(settings.remoteConfigurations || {}).some(
@@ -473,36 +582,15 @@ export abstract class SettingService<T extends ServiceContext = ServiceContext>
             }
         } else {
             if (settings.encryptedCouchDBConnection) {
-                const keys = [
-                    "couchDB_URI",
-                    "couchDB_USER",
-                    "couchDB_PASSWORD",
-                    "couchDB_DBNAME",
-                    "accessKey",
-                    "bucket",
-                    "endpoint",
-                    "region",
-                    "secretKey",
-                ] as (keyof CouchDBConnection | keyof BucketSyncSetting)[];
                 const decrypted = this.tryDecodeJson(
                     await this.decryptConfigurationItem(settings.encryptedCouchDBConnection, passphrase)
-                ) as CouchDBConnection & BucketSyncSetting;
-                if (decrypted) {
-                    for (const key of keys) {
-                        if (key in decrypted) {
-                            //@ts-ignore
-                            settings[key] = decrypted[key];
-                        }
-                    }
-                } else {
+                );
+                if (!restoreConnectionSettings(settings, decrypted)) {
                     this._log(
                         "Failed to decrypt passphrase from data.json! Ensure configuration is correct before syncing with remote.",
                         LOG_LEVEL_URGENT
                     );
-                    for (const key of keys) {
-                        //@ts-ignore
-                        settings[key] = "";
-                    }
+                    clearConnectionSettings(settings);
                 }
             }
             if (settings.encrypt && settings.encryptedPassphrase) {
@@ -524,15 +612,15 @@ export abstract class SettingService<T extends ServiceContext = ServiceContext>
     }
 
     async loadSettings(): Promise<void> {
-        const settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+        const prepared = prepareSettingsForLoad(await this.loadData());
+        const { settings, ...migrationState } = prepared;
+        this._settingsMigrationState = migrationState;
         const hadRemoteConfigurations = Object.keys(settings.remoteConfigurations ?? {}).length > 0;
 
         if (typeof settings.isConfigured == "undefined") {
-            // If migrated, mark true
-            if (JSON.stringify(settings) !== JSON.stringify(DEFAULT_SETTINGS)) {
+            if (!prepared.isNewVault) {
                 settings.isConfigured = true;
             } else {
-                //
                 const appId = this.APIService.getAppID();
                 settings.additionalSuffixOfDatabaseName = appId;
                 settings.isConfigured = false;
@@ -542,7 +630,7 @@ export abstract class SettingService<T extends ServiceContext = ServiceContext>
         this.settings = await this.decryptSettings(settings);
 
         // I wonder can we call here.
-        setLang(this.settings.displayLanguage);
+        this.onDisplayLanguageChanged?.(this.settings.displayLanguage);
 
         await this.adjustSettings(this.settings);
         const migratedLegacyRemoteConfigurations =
@@ -591,7 +679,7 @@ export abstract class SettingService<T extends ServiceContext = ServiceContext>
             this.APIService.getSystemVaultName() +
             this.additionalSuffixOfDatabaseName();
         if (this.settings.deviceAndVaultName != "") {
-            if (!this.getItem(lsKey)) {
+            if (!this.getDeviceLocalConfig(lsKey)) {
                 this.setDeviceAndVaultName(this.settings.deviceAndVaultName);
                 this.saveDeviceAndVaultName();
                 this.settings.deviceAndVaultName = "";
@@ -604,7 +692,7 @@ export abstract class SettingService<T extends ServiceContext = ServiceContext>
             );
             this.settings.customChunkSize = 0;
         }
-        this.setDeviceAndVaultName(this.getItem(lsKey) || "");
+        this.setDeviceAndVaultName(this.getDeviceLocalConfig(lsKey) || "");
         if (this.getDeviceAndVaultName() == "") {
             if (this.settings.usePluginSync) {
                 this._log("Device name missing. Disabling plug-in sync.", LOG_LEVEL_NOTICE);
@@ -612,14 +700,16 @@ export abstract class SettingService<T extends ServiceContext = ServiceContext>
             }
         }
 
-        if (migratedLegacyRemoteConfigurations || migratedP2PActiveRemoteConfiguration) {
+        if (
+            !prepared.isFromFutureSchema &&
+            (prepared.changed || migratedLegacyRemoteConfigurations || migratedP2PActiveRemoteConfiguration)
+        ) {
             await this.saveSettingData();
         }
 
         this._lastPersistedSettings = this.cloneSettings(this.settings);
 
         // this.core.ignoreFiles = this.settings.ignoreFiles.split(",").map(e => e.trim());
-        // eventHub.emitEvent(EVENT_REQUEST_RELOAD_SETTING_TAB);
         const dispatch = this.settings;
         void this.onSettingLoaded(dispatch);
         void this.onSettingChanged(dispatch);
@@ -635,10 +725,10 @@ export abstract class SettingService<T extends ServiceContext = ServiceContext>
 
     private cloneSettings(settings: ObsidianLiveSyncSettings): ObsidianLiveSyncSettings {
         return {
-            ...settings,
+            ...omitP2PRuntimeSettings(settings),
             remoteConfigurations: Object.fromEntries(
                 Object.entries(settings.remoteConfigurations || {}).map(([id, config]) => [id, { ...config }])
             ),
-        };
+        } as ObsidianLiveSyncSettings;
     }
 }

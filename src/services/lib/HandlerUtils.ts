@@ -343,6 +343,75 @@ export class AllHandler<T extends unknown[]> extends BooleanHandlerBase<T> {
         return true;
     }
 }
+
+/**
+ * A handler that preserves a non-boolean continuation result while continuing
+ * to give false results and exceptions veto power.
+ */
+export class AllWithResultHandler<T extends unknown[], U extends boolean | string>
+    extends MultiBinder<BooleanHandlerFunc<T, U>>
+    implements InvokableHandler<T, U>
+{
+    /**
+     * Invokes every handler in order. The first non-boolean continuation result
+     * is retained, but every remaining handler can still reject the operation.
+     * @param args The arguments to pass to the handlers.
+     * @returns False after any failure, otherwise the retained result or true.
+     */
+    async invoke(...args: T): Promise<U> {
+        let aggregateResult = true as U;
+        const callbacks = [...this._callbacks];
+        for (const callback of callbacks) {
+            try {
+                const result = await Promise.resolve(callback(...args));
+                if (result === false) {
+                    return false as U;
+                }
+                if (aggregateResult === true && result !== true) {
+                    aggregateResult = result;
+                }
+            } catch (error) {
+                Logger(`AllWithResultHandler ${this._name} treated error as failure!`, LOG_LEVEL_VERBOSE);
+                Logger(error, LOG_LEVEL_VERBOSE);
+                return false as U;
+            }
+        }
+        return aggregateResult;
+    }
+}
+
+/**
+ * A handler that invokes every added handler sequentially and reports whether
+ * all of them succeeded.
+ *
+ * Unlike {@link AllHandler}, a failure does not prevent later cleanup handlers
+ * from settling.
+ */
+export class SettledAllHandler<T extends unknown[]> extends BooleanHandlerBase<T> {
+    /**
+     * Invokes every handler in order, treating a false result or an exception
+     * as an aggregate failure.
+     * @param args The arguments to pass to the handlers.
+     * @returns True only when every handler succeeds.
+     */
+    async invoke(...args: T): Promise<boolean> {
+        let succeeded = true;
+        const callbacks = [...this._callbacks];
+        for (const callback of callbacks) {
+            try {
+                const result = await Promise.resolve(callback(...args));
+                if (result === false) {
+                    succeeded = false;
+                }
+            } catch (error) {
+                Logger(`SettledAllHandler ${this._name} treated error as failure!`, LOG_LEVEL_VERBOSE);
+                Logger(error, LOG_LEVEL_VERBOSE);
+                succeeded = false;
+            }
+        }
+        return succeeded;
+    }
+}
 /**
  * A handler that invokes all added handler functions in parallel and returns true only if all return true.
  */
@@ -473,7 +542,7 @@ export interface MultipleHandlerFunction<TFunc extends (...args: any[]) => U | P
      * @param callback The handler function to add.
      * @returns A function to remove the added handler.
      */
-    addHandler: (callback: TFunc) => () => void;
+    addHandler: (callback: TFunc, priority?: number) => () => void;
     /**
      * Removes a handler function.
      * @param callback The handler function to remove.
@@ -569,11 +638,29 @@ export function allFunction<TFunc extends (...args: any[]) => Promise<boolean>>(
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- covariant in return type, so cannot be generic.
+export function allSettledFunction<TFunc extends (...args: any[]) => Promise<boolean>>(
+    name?: string
+): BooleanMultipleHandlerFunction<TFunc> {
+    const handler = new SettledAllHandler<Parameters<TFunc>>(name ?? "allSettledFunction");
+    return getMultipleBound(handler);
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- covariant in return type, so cannot be generic.
 export function bailFirstFailureFunction<TFunc extends (...args: any[]) => Promise<boolean>>(
     name?: string
 ): BooleanMultipleHandlerFunction<TFunc> {
     const handler = new AllHandler<Parameters<TFunc>>(name ?? "bailFirstFailureFunction");
     return getMultipleBound(handler);
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- covariant in return type, so cannot be generic.
+export function bailFirstFailureWithResultFunction<TFunc extends (...args: any[]) => Promise<boolean | string>>(
+    name?: string
+): MultipleHandlerFunction<TFunc> {
+    const handler = new AllWithResultHandler<Parameters<TFunc>, Awaited<ReturnType<TFunc>>>(
+        name ?? "bailFirstFailureWithResultFunction"
+    );
+    return getMultipleBound(handler) as unknown as MultipleHandlerFunction<TFunc>;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- covariant in return type, so cannot be generic.
@@ -655,6 +742,19 @@ export function handlers<T extends object>() {
             return allFunction<Extract<T[K], (...args: any[]) => Promise<boolean>>>(String(name));
         },
         /**
+         * Create a handler that invokes every added handler sequentially and
+         * returns true only if all of them succeed.
+         * @param name
+         * @returns
+         */
+        allSettled<K extends FunctionKeys<T>>(
+            name: K
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- parameter type is covariant in return type, so cannot be generic.
+        ): BooleanMultipleHandlerFunction<Extract<T[K], (...args: any[]) => Promise<boolean>>> {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- covariant in return type, so cannot be generic.
+            return allSettledFunction<Extract<T[K], (...args: any[]) => Promise<boolean>>>(String(name));
+        },
+        /**
          * Create a handler that invokes all added handler functions in parallel and returns true only if all return true.
          * @param name
          * @returns
@@ -677,6 +777,22 @@ export function handlers<T extends object>() {
         ): BooleanMultipleHandlerFunction<Extract<T[K], (...args: any[]) => Promise<boolean>>> {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any -- covariant in return type, so cannot be generic.
             return bailFirstFailureFunction<Extract<T[K], (...args: any[]) => Promise<boolean>>>(String(name));
+        },
+        /**
+         * Create a handler that preserves a non-boolean continuation result, but
+         * still invokes later handlers so that false results and exceptions
+         * can reject the operation.
+         * @param name
+         * @returns
+         */
+        bailFirstFailureWithResult<K extends FunctionKeys<T>>(
+            name: K
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- parameter type is covariant in return type, so cannot be generic.
+        ): MultipleHandlerFunction<Extract<T[K], (...args: any[]) => Promise<boolean | string>>> {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- covariant in return type, so cannot be generic.
+            return bailFirstFailureWithResultFunction<Extract<T[K], (...args: any[]) => Promise<boolean | string>>>(
+                String(name)
+            );
         },
         /**
          * Create a handler that invokes all added handler functions sequentially until one returns true.

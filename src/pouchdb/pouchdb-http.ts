@@ -11,6 +11,7 @@ type CouchDBAuth = {
 };
 
 type CouchDBConfig = {
+    fetch?: (input: string | Request, init?: RequestInit) => Promise<Response>;
     auth?: CouchDBAuth;
 };
 
@@ -86,7 +87,11 @@ function encodeQueryValue(value: unknown): string {
     return JSON.stringify(value);
 }
 
-function couchError(status: number, body: CouchErrorBody | string, fallback: string): Error & {
+function couchError(
+    status: number,
+    body: CouchErrorBody | string,
+    fallback: string
+): Error & {
     status: number;
     name: string;
     error?: string;
@@ -140,7 +145,7 @@ class CouchChanges<T extends object> extends MinimalEventEmitter implements Prom
 
     constructor(
         private db: PouchDB<T>,
-        private options: Record<string, any>,
+        private options: Record<string, any>
     ) {
         super();
         this.promise = this.run();
@@ -148,7 +153,7 @@ class CouchChanges<T extends object> extends MinimalEventEmitter implements Prom
         // this thenable. Mark the internal rejection as observed so a
         // transient CouchDB/network error does not terminate the Node process;
         // awaiting the original promise still rejects as expected.
-        void this.promise.catch(() => undefined);
+        void this.promise.catch((): void => {});
     }
 
     cancel(): void {
@@ -158,7 +163,7 @@ class CouchChanges<T extends object> extends MinimalEventEmitter implements Prom
 
     then<TResult1 = any, TResult2 = never>(
         onfulfilled?: ((value: any) => TResult1 | PromiseLike<TResult1>) | null,
-        onrejected?: ((reason: any) => TResult2 | PromiseLike<TResult2>) | null,
+        onrejected?: ((reason: any) => TResult2 | PromiseLike<TResult2>) | null
     ): PromiseLike<TResult1 | TResult2> {
         return this.promise.then(onfulfilled, onrejected);
     }
@@ -174,7 +179,7 @@ class CouchChanges<T extends object> extends MinimalEventEmitter implements Prom
             return response;
         } catch (error) {
             if (this.cancelled && error instanceof DOMException && error.name === "AbortError") {
-                const response = { results: [], last_seq: this.lastSeq ?? this.options.since ?? "0" };
+                const response = { results: [] as any[], last_seq: this.lastSeq ?? this.options.since ?? "0" };
                 await this.emit("complete", response);
                 return response;
             }
@@ -185,7 +190,7 @@ class CouchChanges<T extends object> extends MinimalEventEmitter implements Prom
 
     private async runLive(): Promise<any> {
         const initialSince = this.options.since;
-        let since = initialSince === "" ? "0" : initialSince ?? "now";
+        let since = initialSince === "" ? "0" : (initialSince ?? "now");
         do {
             const response = await this.db.requestChanges(
                 {
@@ -195,14 +200,14 @@ class CouchChanges<T extends object> extends MinimalEventEmitter implements Prom
                     feed: "longpoll",
                     timeout: 60000,
                 },
-                this.controller.signal,
+                this.controller.signal
             );
             await this.emitChanges(response.results ?? []);
             since = response.last_seq ?? since;
             this.lastSeq = since;
         } while (!this.cancelled);
 
-        const complete = { results: [], last_seq: since };
+        const complete = { results: [] as any[], last_seq: since };
         await this.emit("complete", complete);
         return complete;
     }
@@ -219,11 +224,13 @@ export class PouchDB<T extends object = any> extends MinimalEventEmitter {
     private transforms: TransformHooks[] = [];
     private readonly baseUrl: string;
     private readonly auth?: CouchDBAuth;
+    private readonly fetchImplementation: (input: string | Request, init?: RequestInit) => Promise<Response>;
 
     constructor(url: string, config: CouchDBConfig = {}) {
         super();
         this.baseUrl = url.replace(/\/+$/, "");
         this.auth = config.auth;
+        this.fetchImplementation = config.fetch ?? ((input, init) => globalThis.fetch(input, init));
     }
 
     static plugin(_plugin: unknown): typeof PouchDB {
@@ -259,7 +266,7 @@ export class PouchDB<T extends object = any> extends MinimalEventEmitter {
 
     async put<U extends object = T>(
         doc: U & Record<string, any>,
-        options: Record<string, any> = {},
+        options: Record<string, any> = {}
     ): Promise<{ ok: boolean; id: string; rev: string }> {
         const prepared = await this.prepareIncomingForWrite({ ...doc }, options);
         const id = prepared._id;
@@ -269,7 +276,11 @@ export class PouchDB<T extends object = any> extends MinimalEventEmitter {
         return await this.requestJson([encodeDocId(id)], options, "PUT", prepared);
     }
 
-    async remove(id: string, rev: string, options: Record<string, any> = {}): Promise<{ ok: boolean; id: string; rev: string }> {
+    async remove(
+        id: string,
+        rev: string,
+        options: Record<string, any> = {}
+    ): Promise<{ ok: boolean; id: string; rev: string }> {
         return await this.requestJson([encodeDocId(id)], { ...options, rev }, "DELETE");
     }
 
@@ -280,7 +291,9 @@ export class PouchDB<T extends object = any> extends MinimalEventEmitter {
             : await this.requestJson(["_all_docs"], query, "GET");
         if (options.include_docs && response.rows) {
             response.rows = await Promise.all(
-                response.rows.map(async (row: any) => row.doc ? { ...row, doc: await this.applyOutgoing(row.doc) } : row),
+                response.rows.map(async (row: any) =>
+                    row.doc ? { ...row, doc: await this.applyOutgoing(row.doc) } : row
+                )
             );
         }
         return response;
@@ -288,7 +301,7 @@ export class PouchDB<T extends object = any> extends MinimalEventEmitter {
 
     async bulkDocs<U extends object = T>(
         docs: Array<U & Record<string, any>>,
-        options: Record<string, any> = {},
+        options: Record<string, any> = {}
     ): Promise<any[]> {
         const prepared = await Promise.all(docs.map((doc) => this.prepareIncomingForWrite({ ...doc }, options)));
         const results = await this.requestJson(["_bulk_docs"], {}, "POST", {
@@ -313,9 +326,9 @@ export class PouchDB<T extends object = any> extends MinimalEventEmitter {
                     docs: await Promise.all(
                         (result.docs ?? []).map(async (entry: any) =>
                             entry.ok ? { ...entry, ok: await this.applyOutgoing(entry.ok) } : entry
-                        ),
+                        )
                     ),
-                })),
+                }))
             );
         }
         return response;
@@ -348,23 +361,24 @@ export class PouchDB<T extends object = any> extends MinimalEventEmitter {
             response.results = await Promise.all(
                 response.results.map(async (change: any) =>
                     change.doc ? { ...change, doc: await this.applyOutgoing(change.doc) } : change
-                ),
+                )
             );
         }
         return response;
     }
 
     async purgeMulti(docs: PurgeMultiParam[]): Promise<Record<string, PurgeMultiResult | Error>> {
-        const tasks = docs.map(
-            ([docId, rev]) => async (): Promise<[PurgeMultiParam, PurgeMultiResult | Error]> => {
-                try {
-                    const result = await this.requestJson(["_purge"], {}, "POST", { [docId]: [rev] });
-                    return [[docId, rev], result[docId] ?? { ok: true, deletedRevs: [rev], documentWasRemovedCompletely: false }];
-                } catch (error) {
-                    return [[docId, rev], error instanceof Error ? error : new Error(String(error))];
-                }
-            },
-        );
+        const tasks = docs.map(([docId, rev]) => async (): Promise<[PurgeMultiParam, PurgeMultiResult | Error]> => {
+            try {
+                const result = await this.requestJson(["_purge"], {}, "POST", { [docId]: [rev] });
+                return [
+                    [docId, rev],
+                    result[docId] ?? { ok: true, deletedRevs: [rev], documentWasRemovedCompletely: false },
+                ];
+            } catch (error) {
+                return [[docId, rev], error instanceof Error ? error : new Error(String(error))];
+            }
+        });
         const ret = await mapAllTasksWithConcurrencyLimit(1, tasks);
         const retAll = ret.map((e) => unwrapTaskResult(e)) as [PurgeMultiParam, PurgeMultiResult | Error][];
         await appendPurgeSeqs(
@@ -374,7 +388,10 @@ export class PouchDB<T extends object = any> extends MinimalEventEmitter {
         return Object.fromEntries(retAll.map((e) => [e[0][0], e[1]]));
     }
 
-    private async prepareIncomingForWrite(doc: Record<string, any>, options: Record<string, any>): Promise<Record<string, any>> {
+    private async prepareIncomingForWrite(
+        doc: Record<string, any>,
+        options: Record<string, any>
+    ): Promise<Record<string, any>> {
         const transformed = options.skipTransform ? doc : await this.applyIncoming(doc);
         if (options.force && transformed._id && !transformed._rev) {
             try {
@@ -412,7 +429,7 @@ export class PouchDB<T extends object = any> extends MinimalEventEmitter {
         query: Record<string, any> = {},
         method = "GET",
         body?: unknown,
-        signal?: AbortSignal,
+        signal?: AbortSignal
     ): Promise<any> {
         const url = new URL(`${this.baseUrl}/${path.join("/")}`);
         for (const [key, value] of Object.entries(query)) {
@@ -426,7 +443,7 @@ export class PouchDB<T extends object = any> extends MinimalEventEmitter {
             headers.set("authorization", `Basic ${btoa(`${this.auth.username ?? ""}:${this.auth.password ?? ""}`)}`);
         }
 
-        const response = await fetch(url, {
+        const response = await this.fetchImplementation(url.toString(), {
             method,
             headers,
             body: body === undefined ? undefined : JSON.stringify(body),
