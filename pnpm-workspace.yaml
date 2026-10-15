@@ -1,0 +1,12 @@
+allowBuilds:
+  esbuild: true
+minimumReleaseAgeExclude:
+  - '@aws-sdk/client-s3@3.1152.0'
+  - '@typescript/typescript-darwin-arm64@7.1.0-dev.20261015.1'
+  - '@typescript/typescript-darwin-x64@7.1.0-dev.20261015.1'
+  - '@typescript/typescript-linux-arm64@7.1.0-dev.20261015.1'
+  - '@typescript/typescript-linux-arm@7.1.0-dev.20261015.1'
+  - '@typescript/typescript-linux-x64@7.1.0-dev.20261015.1'
+  - '@typescript/typescript-win32-arm64@7.1.0-dev.20261015.1'
+  - '@typescript/typescript-win32-x64@7.1.0-dev.20261015.1'
+  - typescript@7.1.0-dev.20261015.1

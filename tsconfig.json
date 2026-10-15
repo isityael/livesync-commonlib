@@ -4,13 +4,13 @@
     "module": "ESNext",
     "moduleResolution": "Bundler",
     "lib": ["ES2022", "DOM", "DOM.Iterable", "WebWorker"],
-    "types": ["node", "svelte"],
-    "baseUrl": ".",
+    "types": ["node", "svelte", "pouchdb"],
     "paths": {
-      "@lib/*": ["src/*"]
+      "@lib/*": ["./src/*"]
     },
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true,
+    "strict": false,
     "noImplicitAny": true,
     "noImplicitOverride": true,
     "strictBindCallApply": true,
