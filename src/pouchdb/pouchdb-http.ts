@@ -434,7 +434,11 @@ export class PouchDB<T extends object = any> extends MinimalEventEmitter {
         const url = new URL(`${this.baseUrl}/${path.join("/")}`);
         for (const [key, value] of Object.entries(query)) {
             if (value === undefined || value === null || value === false) continue;
-            url.searchParams.set(key, encodeQueryValue(value));
+            // CouchDB treats document key bounds as JSON values, including string quotes.
+            url.searchParams.set(
+                key,
+                ["key", "startkey", "endkey"].includes(key) ? JSON.stringify(value) : encodeQueryValue(value)
+            );
         }
 
         const headers = new Headers({ accept: "application/json" });

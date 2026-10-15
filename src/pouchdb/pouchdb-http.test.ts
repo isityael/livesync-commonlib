@@ -193,3 +193,16 @@ it("PouchDB live changes normalizes an empty since checkpoint", async () => {
         globalThis.fetch = originalFetch;
     }
 });
+
+it("PouchDB allDocs serializes document key bounds as JSON strings", async () => {
+    const db = new PouchDB("https://couch.example/vault", {
+        fetch: async (input) => {
+            const url = new URL(String(input));
+            assert(url.searchParams.get("startkey") === JSON.stringify("f:"), "startkey must be JSON encoded");
+            assert(url.searchParams.get("endkey") === JSON.stringify("f:\ufff0"), "endkey must be JSON encoded");
+            assert(url.searchParams.get("limit") === "2", "numeric query options must remain numbers");
+            return jsonResponse({ rows: [] });
+        },
+    });
+    await db.allDocs({ startkey: "f:", endkey: "f:\ufff0", limit: 2 });
+});
