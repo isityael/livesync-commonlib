@@ -657,7 +657,8 @@ const manifest = JSON.parse(
     await readFile(resolve(consumerDirectory, "node_modules", "@vrtmrz", "livesync-commonlib", "package.json"), "utf8")
 );
 const installedPackageDirectory = resolve(consumerDirectory, "node_modules", "@vrtmrz", "livesync-commonlib");
-const { default: ts } = await import("typescript");
+// TypeScript 7 supplies the native CLI; module resolution still needs the JS compiler API.
+const { default: ts } = await import("typescript-compiler-api");
 const compilerOptions = {
     module: ts.ModuleKind.ESNext,
     moduleResolution: ts.ModuleResolutionKind.Node10,

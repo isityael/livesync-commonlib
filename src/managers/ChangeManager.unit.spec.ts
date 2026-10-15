@@ -80,7 +80,7 @@ describe("ChangeManager", () => {
         // Wait for the change event to be processed
         await new Promise((resolve) => setTimeout(resolve, PROMISE_SLEEP));
 
-        expect(callback).toHaveBeenCalledTimes(1);
+        await vi.waitFor(() => expect(callback).toHaveBeenCalledTimes(1));
         expect(callback).toHaveBeenCalledWith(
             expect.objectContaining({
                 id: "doc1",
@@ -95,11 +95,15 @@ describe("ChangeManager", () => {
     it("should invoke callbacks when a document is updated", async () => {
         const callback = vi.fn();
 
+        const initialChange = vi.fn();
+        const stopInitialChange = changeManager.addCallback(initialChange);
+
         // Add a document first
         const result = await db.put({ _id: "doc1", data: "initial data" });
 
-        // Wait for initial change
-        await new Promise((resolve) => setTimeout(resolve, PROMISE_SLEEP));
+        // Observe the initial change before registering the callback under test.
+        await vi.waitFor(() => expect(initialChange).toHaveBeenCalledTimes(1));
+        stopInitialChange();
 
         // Now add the callback
         changeManager.addCallback(callback);
@@ -110,7 +114,7 @@ describe("ChangeManager", () => {
         // Wait for the change event to be processed
         await new Promise((resolve) => setTimeout(resolve, PROMISE_SLEEP * 2));
 
-        expect(callback).toHaveBeenCalledTimes(1);
+        await vi.waitFor(() => expect(callback).toHaveBeenCalledTimes(1));
         expect(callback).toHaveBeenCalledWith(
             expect.objectContaining({
                 id: "doc1",
@@ -125,11 +129,15 @@ describe("ChangeManager", () => {
     it("should invoke callbacks when a document is deleted", async () => {
         const callback = vi.fn();
 
+        const initialChange = vi.fn();
+        const stopInitialChange = changeManager.addCallback(initialChange);
+
         // Add a document first
         const result = await db.put({ _id: "doc1", data: "test data" });
 
-        // Wait for initial change
-        await new Promise((resolve) => setTimeout(resolve, PROMISE_SLEEP));
+        // Observe the initial change before registering the callback under test.
+        await vi.waitFor(() => expect(initialChange).toHaveBeenCalledTimes(1));
+        stopInitialChange();
 
         // Now add the callback
         changeManager.addCallback(callback);
@@ -140,7 +148,7 @@ describe("ChangeManager", () => {
         // Wait for the change event to be processed
         await new Promise((resolve) => setTimeout(resolve, PROMISE_SLEEP));
 
-        expect(callback).toHaveBeenCalledTimes(1);
+        await vi.waitFor(() => expect(callback).toHaveBeenCalledTimes(1));
         expect(callback).toHaveBeenCalledWith(
             expect.objectContaining({
                 id: "doc1",
@@ -162,8 +170,8 @@ describe("ChangeManager", () => {
         // Wait for the change event to be processed
         await new Promise((resolve) => setTimeout(resolve, PROMISE_SLEEP));
 
-        expect(callback1).toHaveBeenCalledTimes(1);
-        expect(callback2).toHaveBeenCalledTimes(1);
+        await vi.waitFor(() => expect(callback1).toHaveBeenCalledTimes(1));
+        await vi.waitFor(() => expect(callback2).toHaveBeenCalledTimes(1));
     });
 
     it("should not invoke callbacks after unsubscribe", async () => {
@@ -197,7 +205,7 @@ describe("ChangeManager", () => {
         // Wait for the async callback to complete
         await new Promise((resolve) => setTimeout(resolve, PROMISE_SLEEP * 2));
 
-        expect(callbackExecuted).toBe(true);
+        await vi.waitFor(() => expect(callbackExecuted).toBe(true));
     });
 
     it("should clean up dead WeakRefs when processing changes", async () => {
@@ -233,7 +241,7 @@ describe("ChangeManager", () => {
         await new Promise((resolve) => setTimeout(resolve, PROMISE_SLEEP));
 
         // The live callback should be invoked
-        expect(liveCallback).toHaveBeenCalledTimes(1);
+        await vi.waitFor(() => expect(liveCallback).toHaveBeenCalledTimes(1));
     });
 
     it("should teardown the changes listener", async () => {
@@ -261,7 +269,7 @@ describe("ChangeManager", () => {
         await db.put({ _id: "doc1", data: "before restart" });
         await new Promise((resolve) => setTimeout(resolve, PROMISE_SLEEP));
 
-        expect(callback).toHaveBeenCalledTimes(1);
+        await vi.waitFor(() => expect(callback).toHaveBeenCalledTimes(1));
 
         // Restart the watch
         changeManager.restartWatch();
@@ -271,7 +279,7 @@ describe("ChangeManager", () => {
         await new Promise((resolve) => setTimeout(resolve, PROMISE_SLEEP));
 
         // Callback should be invoked again (total of 2 times)
-        expect(callback).toHaveBeenCalledTimes(2);
+        await vi.waitFor(() => expect(callback).toHaveBeenCalledTimes(2));
 
         // Restart the watch again
         changeManager.restartWatch();
@@ -279,7 +287,7 @@ describe("ChangeManager", () => {
         await new Promise((resolve) => setTimeout(resolve, PROMISE_SLEEP));
 
         // Callback should be invoked again (total of 3 times)
-        expect(callback).toHaveBeenCalledTimes(3);
+        await vi.waitFor(() => expect(callback).toHaveBeenCalledTimes(3));
     });
 
     it("should accept unexpected setupListener", async () => {
@@ -290,7 +298,7 @@ describe("ChangeManager", () => {
         await db.put({ _id: "doc1", data: "before restart" });
         await new Promise((resolve) => setTimeout(resolve, PROMISE_SLEEP));
 
-        expect(callback).toHaveBeenCalledTimes(1);
+        await vi.waitFor(() => expect(callback).toHaveBeenCalledTimes(1));
 
         // Restart the watch
         changeManager.restartWatch();
@@ -300,7 +308,7 @@ describe("ChangeManager", () => {
         await new Promise((resolve) => setTimeout(resolve, PROMISE_SLEEP));
 
         // Callback should be invoked again (total of 2 times)
-        expect(callback).toHaveBeenCalledTimes(2);
+        await vi.waitFor(() => expect(callback).toHaveBeenCalledTimes(2));
 
         // Force setupListener to be called again (simulate unexpected call)
         changeManager.setupListener();
@@ -308,7 +316,7 @@ describe("ChangeManager", () => {
         await new Promise((resolve) => setTimeout(resolve, PROMISE_SLEEP));
 
         // Callback should be invoked again (total of 3 times)
-        expect(callback).toHaveBeenCalledTimes(3);
+        await vi.waitFor(() => expect(callback).toHaveBeenCalledTimes(3));
     });
 
     it("should only listen to changes since 'now' (not historical)", async () => {
@@ -334,7 +342,7 @@ describe("ChangeManager", () => {
         await new Promise((resolve) => setTimeout(resolve, PROMISE_SLEEP));
 
         // Should receive the new change
-        expect(callback).toHaveBeenCalledTimes(1);
+        await vi.waitFor(() => expect(callback).toHaveBeenCalledTimes(1));
 
         // Clean up
         newManager.teardown();
@@ -353,7 +361,7 @@ describe("ChangeManager", () => {
         // Wait for all changes to be processed
         await new Promise((resolve) => setTimeout(resolve, PROMISE_SLEEP));
 
-        expect(callback).toHaveBeenCalledTimes(3);
+        await vi.waitFor(() => expect(callback).toHaveBeenCalledTimes(3));
     });
 
     it("should handle rapid bulk changes", async () => {
@@ -371,7 +379,7 @@ describe("ChangeManager", () => {
         // Wait for all changes to be processed
         await new Promise((resolve) => setTimeout(resolve, PROMISE_SLEEP));
 
-        expect(callback).toHaveBeenCalledTimes(10);
+        await vi.waitFor(() => expect(callback).toHaveBeenCalledTimes(10));
     });
 
     it("should not invoke callbacks if there are no registered callbacks", async () => {
@@ -398,6 +406,6 @@ describe("ChangeManager", () => {
         await new Promise((resolve) => setTimeout(resolve, PROMISE_SLEEP));
 
         // Normal callback should still be called even if one callback throws an error
-        expect(normalCallback).toHaveBeenCalledTimes(1);
+        await vi.waitFor(() => expect(normalCallback).toHaveBeenCalledTimes(1));
     });
 });

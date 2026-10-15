@@ -67,6 +67,8 @@ npm run test:boundary
 npm run test:package
 ```
 
+The fork uses the TypeScript 7 native CLI for compilation. The packed-consumer resolver imports the pinned `typescript-compiler-api` alias because module-resolution APIs remain available through the TypeScript 6 JavaScript compiler. Keep these roles separate when updating the compiler.
+
 `test:package` builds the compiled package, packs it, installs the tarball into a clean consumer fixture, exercises Node imports, type-checks public entry points, and creates representative browser bundles. It also verifies that browser and context entry points do not pull in Node-only code, Svelte, or the complete language catalogue unintentionally.
 
 `test:contracts` runs the host-neutral result contracts which are intended to be reusable while implementations move:
