@@ -33,6 +33,13 @@ describe("direct CouchDB access with an independent ID key", () => {
         };
         const path = "notes/one.md" as FilePathWithPrefix;
 
+        // The HTTP client connects to an existing database; provision this disposable fixture explicitly.
+        const created = await fetch(url.replace(/\/$/u, "") + "/" + database, {
+            method: "PUT",
+            headers: { Authorization: `Basic ${Buffer.from(`${username}:${password}`).toString("base64")}` },
+        });
+        expect(created.status).toBe(201);
+
         try {
             const first = create(options);
             await first.ready.promise;
