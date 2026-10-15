@@ -57,6 +57,8 @@ Run the managed integration suite as a separate gate when CouchDB streaming fetc
 npm run test:integration:managed
 ```
 
+Managed services default to loopback on a local Docker host. When the test runner itself is a Docker container, set `LIVESYNC_INTEGRATION_HOST` to the Docker host gateway; the CI workflow reads it from the default bridge network so published CouchDB and object-store ports remain reachable.
+
 During focused work, the component scripts remain available independently:
 
 ```bash

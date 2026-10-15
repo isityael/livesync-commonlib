@@ -7,11 +7,13 @@ const composeFile = fileURLToPath(new URL("../test/integration/compose.yml", imp
 const vitestCli = fileURLToPath(new URL("../node_modules/vitest/vitest.mjs", import.meta.url));
 const manageServices = process.argv.includes("--manage-services");
 
+// Containerised CI uses the Docker host gateway for published sibling-service ports.
+const managedHost = process.env.LIVESYNC_INTEGRATION_HOST ?? "127.0.0.1";
 const managedEnvironment = {
-    hostname: "http://127.0.0.1:5989/",
+    hostname: `http://${managedHost}:5989/`,
     username: "admin",
     password: "testpassword",
-    minioEndpoint: "http://127.0.0.1:9000",
+    minioEndpoint: `http://${managedHost}:9000`,
     accessKey: "minioadmin",
     secretKey: "minioadmin",
     bucketName: "livesync-test-bucket",

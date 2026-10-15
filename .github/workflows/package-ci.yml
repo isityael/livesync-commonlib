@@ -55,7 +55,11 @@ jobs:
         run: npm ci
 
       - name: Run integration tests
-        run: npm run test:integration:managed
+        run: |
+          # The Actions job is a container; Compose publishes ports on the Docker host.
+          export LIVESYNC_INTEGRATION_HOST="$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')"
+          test -n "$LIVESYNC_INTEGRATION_HOST"
+          npm run test:integration:managed
 
   package-boundary:
     name: Complete package gate
