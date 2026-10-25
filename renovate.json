@@ -1,0 +1,12 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "packageRules": [
+    {
+      "description": "The package verifier needs the latest JavaScript compiler API (6.x); TypeScript 7 supplies the separate native CLI.",
+      "matchDepNames": [
+        "typescript-compiler-api"
+      ],
+      "allowedVersions": "<7.0.0"
+    }
+  ]
+}

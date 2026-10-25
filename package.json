@@ -1,6 +1,6 @@
 {
     "name": "@vrtmrz/livesync-commonlib",
-    "version": "0.2.0",
+    "version": "0.2.1",
     "description": "Shared data, storage, and replication primitives for Self-hosted LiveSync clients.",
     "private": true,
     "type": "module",
@@ -88,9 +88,9 @@
         "prettier": "4.0.0-alpha.13",
         "svelte": "5.57.2",
         "tinyglobby": "^0.2.17",
-        "typescript": "7.1.0-dev.20261022.1",
+        "typescript": "7.0.2",
         "vitest": "^5.0.4",
-        "typescript-compiler-api": "npm:typescript@7.0.2"
+        "typescript-compiler-api": "npm:typescript@~6.0.3"
     },
     "engines": {
         "node": ">=20"
