@@ -37,6 +37,7 @@ export type SettingPropertyPolicy = (typeof SettingPolicies)[keyof typeof Settin
 /** Every schema property requires an explicit export and persistence policy. */
 export const SETTINGS_PROPERTY_POLICY = {
     liveSync: SettingPolicies.Default,
+    batchSaveInLiveSync: SettingPolicies.Default,
     syncOnSave: SettingPolicies.Default,
     syncOnStart: SettingPolicies.Default,
     syncOnFileOpen: SettingPolicies.Default,
@@ -145,6 +146,7 @@ export const SETTINGS_PROPERTY_POLICY = {
     encrypt: SettingPolicies.Default,
     passphrase: SettingPolicies.E2EEPassphrase,
     idDerivationVersion: SettingPolicies.MarkdownCredentials,
+    pathNormalizationVersion: SettingPolicies.MarkdownCredentials,
     idDerivationKey: SettingPolicies.IdDerivationKey,
     usePathObfuscation: SettingPolicies.Default,
     encryptInternalMetadata: SettingPolicies.Default,

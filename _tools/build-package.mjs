@@ -177,6 +177,7 @@ function createExports() {
         ".": exportTarget("index"),
         "./browser": exportTarget("platform/browser/index"),
         "./context": exportTarget("context"),
+        "./diagnostics": exportTarget("diagnostics/index"),
         "./hashing": exportTarget("hashing"),
         "./node": exportTarget("platform/node/index"),
         "./p2p": exportTarget("p2p/index"),
@@ -185,6 +186,7 @@ function createExports() {
         "./remote-configurations": exportTarget("remoteConfigurations"),
         "./settings": exportTarget("settings"),
         "./setup-uri": exportTarget("setupUri"),
+        "./ui-commands": exportTarget("uiCommands"),
     };
     for (const sourcePath of inventory.compatibility) {
         exports[`./compat/${sourcePath}`] =
@@ -266,6 +268,7 @@ async function copyStaticFiles() {
     await mkdir(resolve(packageDirectory, "docs"), { recursive: true });
     for (const document of [
         "conflict-resolution.md",
+        "database-diagnostics.md",
         "development.md",
         "offline-scanner.md",
         "p2p-transport-lifecycle.md",
@@ -279,6 +282,7 @@ async function copyStaticFiles() {
         "settings-lifecycle.md",
         "setup-uri.md",
         "storage-events-and-reflection.md",
+        "unicode-path-identity.md",
     ]) {
         await cp(resolve(root, "docs", document), resolve(packageDirectory, "docs", document));
     }

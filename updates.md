@@ -2,6 +2,150 @@
 
 ## Unreleased
 
+### Added
+
+- Hosts can distinguish completed optional file saves, explicit refusals, and notifications outside a provider's responsibility.
+    - `HandlerOutcome` and `firstHandled` preserve success values and veto reasons, and propagate errors. `processOptionalFileEventWithResult` waits for the actual optional save; hosts migrate their providers together.
+    - Hosts using only the legacy optional notification API retain its boolean contract. A declined notification no longer blocks later updates as though its save had failed.
+
+- Hosts can offer an explicit choice to batch local database updates in LiveSync mode.
+    - `batchSaveInLiveSync` defaults to `false` for existing settings and new Vaults. Older configurations with `liveSync: true, batchSave: true` remain immediate. Other modes retain `batchSave`, and both choices share the existing delay settings.
+    - The new property is optional in the public settings type and participates in the Markdown and QR settings policies.
+
+- We can observe revision-comparison progress even while no documents are received.
+    - Optional CouchDB statistics expose catch-up and continuous stages, direction-specific entry and batch counts, and opaque processed positions. Existing transfer counts retain their meanings.
+    - Progress notifications are batched, with final values flushed when an attempt pauses or ends. These observations do not establish that Vault reflection has finished.
+
+### Fixed
+
+- Accepted file operations remain recoverable while buffered, waiting, or saving to the database.
+    - The existing snapshot format now retains operations through successful processing, with ordered writes and safe replay. Failed handlers or persistence attempts remain visible as failures; releasing a batch delay no longer acknowledges a save.
+- Hosts can wait for a finite set of accepted local saves before synchronisation or settings application proceeds.
+    - `commitPendingFileEvents()` includes buffered and already running work. Later edits do not extend the boundary indefinitely. Waiting timers no longer occupy processing slots needed by unrelated ready files.
+    - Before unload, the maintained file-access service stops event admission and completes work or persists pending records. Failed unload preparation reaches the caller after resource cleanup; synchronous host callbacks should handle the returned promise's rejection.
+- Equal-time offline scans preserve unsaved edits and their revision ancestry through content and provenance checks.
+    - The scanner uses non-forced saves with bounded revalidation. Required content or provenance which cannot be read remains unresolved, and existing partial-scan and strict-caller policies remain in effect.
+
+
+## 0.2.0
+
+23rd October, 2026
+
+The minor version bump to 0.2.0 mostly just means that we have moved on from 0.1.
+
+### Changed
+
+- We can choose device-local storage for each host and await its reads, writes, and deletions.
+    - Service compositions now require an explicit `ValueStore & ValueDeleter` from `@vrtmrz/value-store@0.1.0`. The host owns the adapter and its persistence; separately injected stores remain isolated.
+    - `setting.deviceValues` uses exact local keys, while `setting.config` and the Service Hub `config` share the existing Vault and database-suffix scope. Existing key names and stored values retain their format.
+- We can rely on a defined compatibility policy when updating within the 0.2 line.
+    - Commonlib preserves published APIs, types, behaviour, supported persisted data, and exported `compat/*` paths within 0.2.x. Intentional breaking changes use 0.3.0. This policy starts with 0.2.0 and does not retroactively apply to 0.1.x.
+    - Consumers may use a range such as `^0.2.0`, with a lockfile and `npm ci` for reproducible installation.
+
+- New Vault recommendations use `customChunkSize: 0` for each supported remote type.
+    - Doctor no longer applies the former universal value of `60`. Explicit saved values and values agreed with a remote retain their existing adoption behaviour.
+    - Historical Doctor rules and previous dismissals remain effective. An explicit forced rescan still checks the remaining recommendations.
+
+### Added
+
+- We can inspect joined-device records and remove obsolete records from CouchDB and Object Storage remotes.
+    - The focused `/replication` entry exposes recorded platform, version, acceptance, and connection information, including legacy records with missing fields. Removal preserves other devices and remote state, and rejects removal of the current device.
+    - CouchDB verifies removal after saving; its local documents still permit concurrent overwrites. Object Storage uses ETag conditional writes and reports unsupported servers without an unconditional fallback.
+- Hosts can open the same UI action from settings, notifications, and commands through typed, instance-owned handlers.
+    - The `/ui-commands` entry supplies declarations, typed results, explicit unavailability, and registration disposal. `UIService` owns the registry and disposes it on unload.
+
+- We can opt into Hidden File Sync through `DirectFileManipulatorV2`.
+    - Set `syncInternalFiles: true` in the direct client options. Existing clients retain the disabled default.
+
+### Improved
+
+- Fresh Fast Fetch can hand its completed import to ordinary replication without repeating the initial revision scan.
+    - Hosts may provide the optional `INITIAL_FETCH_FAST_FORWARD` resource. It applies only to a fresh, empty local database with writers suspended and no existing replication checkpoints; resumed imports retain ordinary replication reconciliation.
+    - Disposing the resource during connection preparation closes any connection which arrives afterwards.
+
+### Fixed
+
+- We can store and read Hidden File Sync documents while a normal-file allow-list is set.
+    - The `i:` document prefix bypasses `syncOnlyRegEx`. Hidden-file enablement and `syncIgnoreRegEx` retain their existing behaviour.
+- V3 Chunk boundaries retain a continuous rolling window across splits, improving reuse after local edits.
+    - Binary splitting uses minimum and candidate sizes proportional to the Chunk size limit, while preserving explicit small minimum sizes and UTF-8 boundaries. Existing stored Chunks remain readable; installation does not rewrite unchanged files.
+- Fast Fetch retains all current revision leaves, including deleted conflicts, and their revision ancestry.
+    - Revision reads and writes are batched, and the resume cursor advances only after the required documents and the device-local checkpoint have been stored. A checkpoint write failure stops the fetch before completion or checkpoint handoff.
+
+### Migration from 0.1.x
+
+- Hosts which compose the setting service, `BrowserServiceHub`, or `HeadlessServiceHub` must supply `deviceValues` explicitly. See [Settings lifecycle](docs/settings-lifecycle.md#host-storage-for-device-values-and-configuration) for the Web Storage adapter and preserved key mapping.
+- Replace `getDeviceLocalConfig`, `setDeviceLocalConfig`, and `deleteDeviceLocalConfig` with awaited `setting.deviceValues.getValue`, `setValue`, and `delete` calls. Replace `getSmallConfig`, `setSmallConfig`, and `deleteSmallConfig` with the corresponding awaited operations on `setting.config` or the Service Hub `config`.
+    - A missing value is `null`. Use `getObject` and `setObject` for JSON values, and use `delete` for explicit removal. Await `saveDeviceAndVaultName()` as well.
+- The `compat/services/base/ConfigService` and `compat/services/implements/browser/ConfigServiceBrowserCompat` exports are removed. Use the setting service's `config` view instead of constructing a separate configuration service.
+
+## 0.1.44
+
+20th October, 2026
+
+### Improved
+
+- We can inspect larger databases with fewer remote requests and see how the inspection is progressing.
+    - Integrity inspection uses bounded work and bulk CouchDB reads, with phase counts and timing callbacks. Hosts can exclude the remote for one run; remote inspection remains enabled by default, and reports distinguish exclusion from an unavailable source.
+- We can follow up on a reported file without sharing its original path or losing the relationship between reports.
+    - Path pseudonyms use a random public salt and SHA-256. The token parser and reusable mapper let hosts match exact local paths and retain the same pseudonyms for follow-up. Revision pseudonyms preserve their generation number. Public salts permit guessed-path checks; older ordinal pseudonyms cannot be looked up.
+- We can read large Integrity reports more easily while retaining every observation needed for troubleshooting.
+    - Compact Markdown adds state counts, a review index, and a field guide, and wraps the report for issue comments. The formatting preserves the projected JSON evidence. Review candidates do not establish corruption, and unchecked content remains distinct from healthy content.
+- We can compare recorded Metadata with size, time, and Chunk-reference evidence already available to the inspection.
+    - Findings include Metadata type, recorded size, Chunk-reference counts, case/NFC relationships, and available decoded-content and Vault measurements without additional database or Vault reads.
+- We can follow Usage analysis through revision discovery and accounting, and cancel either stage.
+    - The revision total can grow during discovery. Accounting yields between batches, and cancellation omits unfinished statistics while retaining the run's status and reasons.
+
+### Included from 0.1.43
+
+These changes were first published on `next` in 0.1.43 and are included for consumers upgrading from 0.1.42.
+
+- We can complete NFC Rebuild and Fetch when the local database contains logical deletions without unresolved conflicts.
+    - Operations which replace the local database exclude those deletions from the identity check. Non-deleted duplicates and unresolved conflicts still stop reconstruction, and remote-only Rebuild retains its ID check.
+- We can collect read-only Integrity and Usage reports through the focused `/diagnostics` entry.
+    - Reports retain available local evidence when a remote is unavailable, offer original names or pseudonyms, and omit file contents and credentials. Usage preserves the existing revision selection, Chunk accounting, and nine TSV columns.
+
+## 0.1.43
+
+19th October, 2026
+
+### Fixed
+
+- We can complete NFC Rebuild and Fetch when the local database contains logical deletions without unresolved conflicts.
+    - Full Rebuild, Standard Fetch, and Fast Fetch exclude those deletions from the identity check when replacing the local database. Non-deleted duplicates and unresolved conflicts still stop reconstruction, and remote-only Rebuild retains its ID check.
+
+### Added
+
+- We can inspect normal-file Metadata, current conflict branches, and related content in local databases and CouchDB without changing them.
+    - The focused `/diagnostics` entry supplies structured findings, coverage, cancellation, and JSON and Markdown reports. An unavailable remote retains the local evidence. Older revision history and other remote types remain outside integrity inspection.
+- We can offer temporary pseudonyms or original names for each diagnostic run while keeping file contents and credentials out of reports.
+    - Shared Usage analysis preserves the existing available-revision selection, Chunk accounting, and nine TSV columns. Hosts can retain incomplete results with their reasons in JSON.
+
+## 0.1.42
+
+17th October, 2026
+
+### Fixed
+
+- Hosts can opt into NFC path identity for CouchDB synchronisation, so composed and decomposed Unicode paths derive the same document ID. Existing settings retain legacy identity until an explicit Rebuild or Fetch migration.
+    - Reconstruction checks distinct file and Metadata identities before resetting a database. Journal, P2P, and direct file access refuse the new mode.
+
+- Unchanged files can receive incoming updates after their recorded database revision has been pruned, without creating false conflicts ([Self-hosted LiveSync issue #1207](https://github.com/vrtmrz/obsidian-livesync/issues/1207)).
+    - Device-local provenance retains the saved content's SHA-256 hash and byte length. Legacy records gain this evidence only after their exact content is verified; genuine edits remain protected.
+
+### Added
+
+- Hosts can calculate and benchmark exact file-content hashes through `computeFileContentHash(Blob)` in the `/hashing` entry.
+
+## 0.1.41
+
+16th October, 2026
+
+### Fixed
+
+- Hosts can reflect deletion and rename operations when deleted Metadata is removed.
+    - Metadata reads which include deleted entries retrieve the current PouchDB tombstone and revalidate its revision, including when a restoration arrives during the final deletion check.
+
 ## 0.1.40
 
 15th October, 2026

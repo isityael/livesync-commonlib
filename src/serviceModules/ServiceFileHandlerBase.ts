@@ -12,16 +12,17 @@ import type {
     UXInternalFileInfoStub,
 } from "@lib/common/types";
 import {
+    createBlob,
     getDocDataAsArray,
     isDocContentSame,
-    readAsBlob,
     readContent,
 } from "@lib/common/utils";
+import { computeFileContentHash } from "@lib/common/fileContentHash.ts";
 import { EVENT_CONFLICT_CANCELLED } from "@lib/events/coreEvents";
 import { shouldBeIgnored, stripAllPrefixes } from "@lib/string_and_binary/path";
 import { Semaphore } from "octagonal-wheels/concurrency/semaphore";
 import type { LiveSyncEventHub } from "@lib/hub/hub";
-import type { IFileHandler } from "@lib/interfaces/FileHandler.ts";
+import type { IFileHandler, StoreFileOptions } from "@lib/interfaces/FileHandler.ts";
 import { ServiceModuleBase } from "@lib/serviceModules/ServiceModuleBase";
 import type { APIService } from "@lib/services/base/APIService.ts";
 import type { DatabaseFileAccess } from "@lib/interfaces/DatabaseFileAccess.ts";
@@ -35,6 +36,7 @@ import type { VaultService } from "@lib/services/base/VaultService.ts";
 import { getStoragePathFromUXFileInfo } from "@lib/common/typeUtils";
 import { EVEN } from "@lib/common/models/shared.const.symbols";
 import { tryGetFilePath } from "@lib/common/utils.doc";
+import { getPathNormalizationVersion, normalisePathForIdentity } from "@lib/common/pathNormalization";
 import type {
     FileReflectionProvenance,
     FileReflectionProvenanceRecord,
@@ -82,12 +84,28 @@ function isFolderInfo(info: UXFileInfoStub | UXFolderInfo | null): info is UXFol
 
 type RestoredFileEventAction =
     | { kind: "none" }
-    | { kind: "store"; file: UXFileInfoStub }
+    | { kind: "unresolved" }
+    | { kind: "store"; file: UXFileInfoStub; complete?: boolean }
     | { kind: "delete"; path: FilePath }
     | { kind: "rename"; file: UXFileInfoStub; oldPath: FilePathWithPrefix };
 
 /** Storage bytes and the exact provenance observed with those bytes. */
-type StorageSnapshot = { file: UXFileInfo; revision: string | undefined };
+type StorageSnapshot = { file: UXFileInfo; revision: FileReflectionProvenanceRecord | undefined };
+
+function hasContentHash(record: FileReflectionProvenanceRecord | undefined): boolean {
+    return !!record && typeof record.contentHash === "string" &&
+        /^sha256:[0-9a-f]{64}$/.test(record.contentHash) &&
+        Number.isSafeInteger(record.contentSize) && record.contentSize! >= 0;
+}
+
+function sameProvenance(
+    left: FileReflectionProvenanceRecord | undefined,
+    right: FileReflectionProvenanceRecord | undefined
+): boolean {
+    return left?.revision === right?.revision &&
+        left?.observedStorageMtime === right?.observedStorageMtime &&
+        left?.contentHash === right?.contentHash && left?.contentSize === right?.contentSize;
+}
 
 /**
  * Result of protecting storage from an incoming database reflection.
@@ -111,6 +129,7 @@ export abstract class ServiceFileHandlerBase
     private setting: SettingService;
     private vault: VaultService;
     private fileReflectionProvenance?: FileReflectionProvenance;
+    private readonly contentHashes = new WeakMap<Blob, Promise<string>>();
     private readonly deferredConflictChecks = new Map<string, DeferredConflictCheck[]>();
     constructor(services: ServiceFileHandlerDependencies) {
         super(services);
@@ -132,16 +151,22 @@ export abstract class ServiceFileHandlerBase
         return this.storageAccess;
     }
 
+    private getProvenancePath(path: FilePathWithPrefix): FilePathWithPrefix {
+        return normalisePathForIdentity(
+            path, getPathNormalizationVersion(this.setting.currentSettings())
+        ) as FilePathWithPrefix;
+    }
+
     private async getProvenance(path: FilePathWithPrefix): Promise<FileReflectionProvenanceRecord | undefined> {
         if (!this.fileReflectionProvenance) return undefined;
         try {
-            const record = await this.fileReflectionProvenance.get(path);
+            const record = await this.fileReflectionProvenance.get(this.getProvenancePath(path));
             if (!record) return undefined;
             const entry = await this.db.fetchEntryMeta(path, record.revision, true);
             if (entry && !entry._deleted && !entry.deleted) {
                 return record;
             }
-            await this.fileReflectionProvenance.delete(path);
+            if (!hasContentHash(record)) await this.fileReflectionProvenance.delete(this.getProvenancePath(path));
         } catch (ex) {
             // Store readiness is owned by the host lifecycle. Do not wait or
             // retry here: that can hang failed initialisation or become
@@ -154,16 +179,36 @@ export abstract class ServiceFileHandlerBase
         return undefined;
     }
 
+    private async contentEvidence(content: Blob): Promise<Pick<FileReflectionProvenanceRecord, "contentHash" | "contentSize">> {
+        if (!this.fileReflectionProvenance) return {};
+        try {
+            let hash = this.contentHashes.get(content);
+            if (!hash) {
+                hash = computeFileContentHash(content);
+                this.contentHashes.set(content, hash);
+            }
+            return { contentHash: await hash, contentSize: content.size };
+        } catch (ex) {
+            this.contentHashes.delete(content);
+            this._log("Could not hash file reflection content", LOG_LEVEL_VERBOSE);
+            this._log(ex, LOG_LEVEL_VERBOSE);
+            return {};
+        }
+    }
+
     private async setProvenance(
         path: FilePathWithPrefix,
         revision: string | undefined,
-        observedStorageMtime?: number
+        observedStorageMtime: number | undefined,
+        content: Blob,
+        evidence?: Pick<FileReflectionProvenanceRecord, "contentHash" | "contentSize">
     ): Promise<void> {
         if (!this.fileReflectionProvenance || !revision) return;
         try {
-            await this.fileReflectionProvenance.set(path, {
+            await this.fileReflectionProvenance.set(this.getProvenancePath(path), {
                 revision,
                 observedStorageMtime,
+                ...(evidence ?? await this.contentEvidence(content)),
             });
         } catch (ex) {
             this._log(`Could not record file reflection provenance for ${path}`, LOG_LEVEL_VERBOSE);
@@ -174,7 +219,7 @@ export abstract class ServiceFileHandlerBase
     private async deleteProvenance(path: FilePathWithPrefix): Promise<void> {
         if (!this.fileReflectionProvenance) return;
         try {
-            await this.fileReflectionProvenance.delete(path);
+            await this.fileReflectionProvenance.delete(this.getProvenancePath(path));
         } catch (ex) {
             this._log(`Could not delete file reflection provenance for ${path}`, LOG_LEVEL_VERBOSE);
             this._log(ex, LOG_LEVEL_VERBOSE);
@@ -208,7 +253,7 @@ export abstract class ServiceFileHandlerBase
         }
         const matched = await this.findUniqueContentRevision(file);
         if (matched) {
-            await this.setProvenance(path, matched, file.stat.mtime);
+            await this.setProvenance(path, matched, file.stat.mtime, file.body);
             return matched;
         }
         return undefined;
@@ -223,22 +268,28 @@ export abstract class ServiceFileHandlerBase
      * identifies provenance; no match is `unknown`.
      * `preferredPath` selects the provenance key during a rename, and
      * `currentLoaded` supplies an already decoded candidate body when available.
-     * Missing chunks do not clear provenance unless their metadata is also
-     * missing or deleted.
+     * A valid saved content hash can prove unchanged bytes after revision
+     * pruning. It cannot reconstruct ancestry for an edited file.
      */
     private async classifyStorageContent(
         file: UXFileInfo,
         currentEntry: { _rev?: string; deleted?: boolean; _deleted?: boolean } | false,
         preferredPath?: FilePathWithPrefix,
-        recordedRevision?: string,
-        currentLoaded?: { _rev?: string; data: string | string[] | Blob | ArrayBuffer }
+        recorded?: FileReflectionProvenanceRecord,
+        currentLoaded?: { _rev?: string; data: string | string[] | Blob | ArrayBuffer },
+        requireReadableContent = false
     ): Promise<
         | { kind: "unchanged" | "edited"; revision: string }
         | { kind: "matching-leaf"; revision?: string }
         | { kind: "unknown" }
     > {
         const path = (preferredPath ?? file.path) as FilePathWithPrefix;
+        const recordedRevision = recorded?.revision;
         if (recordedRevision) {
+            if (hasContentHash(recorded) && recorded.contentSize === file.body.size &&
+                (await this.contentEvidence(file.body)).contentHash === recorded.contentHash) {
+                return { kind: "unchanged", revision: recordedRevision };
+            }
             const loadedContentIsDecoded = currentLoaded?._rev === recordedRevision;
             const base = loadedContentIsDecoded
                 ? currentLoaded
@@ -251,11 +302,14 @@ export abstract class ServiceFileHandlerBase
                     : { kind: "edited", revision: recordedRevision };
             }
             // A missing body cannot establish whether storage was changed.
-            // Clear only metadata which is itself missing or deleted; missing chunks
-            // may recover later.
+            // Retain content evidence independently of revision retention.
+            // Missing chunks may also recover later.
             if (!base) {
                 const meta = await this.db.fetchEntryMeta(file, recordedRevision, true);
-                if (!meta || meta.deleted || meta._deleted) await this.deleteProvenance(path);
+                if (requireReadableContent && meta && !meta.deleted && !meta._deleted) {
+                    throw new Error(`Could not read the recorded file revision for ${file.path}`);
+                }
+                if ((!meta || meta.deleted || meta._deleted) && !hasContentHash(recorded)) await this.deleteProvenance(path);
             }
         }
         const matches = currentEntry ? await this.db.findLiveContentRevisions(file, file.body) : [];
@@ -266,19 +320,31 @@ export abstract class ServiceFileHandlerBase
     }
 
     /** Record provenance only when storage matches one unambiguous live leaf. */
-    private async rememberMatchingLeaf(path: FilePathWithPrefix, revision: string | undefined, mtime: number) {
-        if (revision) await this.setProvenance(path, revision, mtime);
+    private async rememberMatchingLeaf(
+        path: FilePathWithPrefix,
+        revision: string | undefined,
+        mtime: number,
+        content: Blob,
+        evidence?: Pick<FileReflectionProvenanceRecord, "contentHash" | "contentSize">
+    ) {
+        if (revision) await this.setProvenance(path, revision, mtime, content, evidence);
     }
 
     /**
      * Read the raw provenance value used by an optimistic storage snapshot.
      * Unlike `getProvenance`, this does not validate or remove the referenced
-     * database revision; an unreadable value is represented as `undefined`.
+     * database revision. Recovery callers require a readable value so a store
+     * failure cannot be mistaken for absent provenance.
      */
-    private async readProvenanceSnapshot(path: FilePathWithPrefix): Promise<string | undefined> {
+    private async readProvenanceSnapshot(
+        path: FilePathWithPrefix,
+        requireReadable = false
+    ): Promise<FileReflectionProvenanceRecord | undefined> {
         try {
-            return (await this.fileReflectionProvenance?.get(path))?.revision;
-        } catch {
+            const record = await this.fileReflectionProvenance?.get(this.getProvenancePath(path));
+            return record ? { ...record } : undefined;
+        } catch (error) {
+            if (requireReadable) throw error;
             return undefined;
         }
     }
@@ -287,13 +353,17 @@ export abstract class ServiceFileHandlerBase
      * Check that storage still has the same path, bytes, timestamp, and
      * provenance as a previously captured snapshot.
      */
-    private async currentStorageSnapshotMatches(file: UXFileInfo, revision: string | undefined): Promise<boolean> {
+    private async currentStorageSnapshotMatches(
+        file: UXFileInfo,
+        revision: FileReflectionProvenanceRecord | undefined,
+        requireReadableProvenance = false
+    ): Promise<boolean> {
         const current = await this.storage.getStub(file.path);
         if (!current || isFolderInfo(current) || current.path !== file.path) return false;
         const readCurrent = await this.readFileFromStub(current);
         return readCurrent.stat.mtime === file.stat.mtime &&
             await isDocContentSame(readCurrent.body, file.body) &&
-            (await this.readProvenanceSnapshot(file.path)) === revision;
+            sameProvenance(await this.readProvenanceSnapshot(file.path, requireReadableProvenance), revision);
     }
 
     /**
@@ -303,11 +373,13 @@ export abstract class ServiceFileHandlerBase
      */
     private async finaliseStoredRevision(
         file: UXFileInfo,
-        observedProvenance: string | undefined,
-        storedRevision: string
+        observedProvenance: FileReflectionProvenanceRecord | undefined,
+        storedRevision: string,
+        requireReadableProvenance = false
     ): Promise<boolean> {
-        if (await this.currentStorageSnapshotMatches(file, observedProvenance)) {
-            await this.setProvenance(file.path, storedRevision, file.stat.mtime);
+        const evidence = await this.contentEvidence(file.body);
+        if (await this.currentStorageSnapshotMatches(file, observedProvenance, requireReadableProvenance)) {
+            await this.setProvenance(file.path, storedRevision, file.stat.mtime, file.body, evidence);
             return true;
         } else {
             // The write is durable, but the storage changed before its provenance
@@ -362,9 +434,12 @@ export abstract class ServiceFileHandlerBase
         try {
             return await this.serializedByFileEventPaths([path], async () => {
                 const provenance = this.fileReflectionProvenance!;
+                const provenancePath = this.getProvenancePath(path);
                 // A recorded branch remains authoritative, even when its
                 // current bytes happen to match the database winner.
-                if (await provenance.get(path)) return false;
+                const existing = await provenance.get(provenancePath);
+                const observed = existing ? { ...existing } : undefined;
+                if (observed && (observed.revision !== expectedRevision || hasContentHash(observed))) return false;
                 const stub = await this.storage.getStub(path);
                 if (!stub || isFolderInfo(stub) || stub.path !== path) return false;
                 const file = await this.readFileFromStub(stub);
@@ -375,12 +450,14 @@ export abstract class ServiceFileHandlerBase
                 if (!entry || entry._rev !== expectedRevision || entry.deleted || entry._deleted) return false;
                 if (!await isDocContentSame(readContent(entry), file.body)) return false;
 
+                const evidence = await this.contentEvidence(file.body);
+                if (!evidence.contentHash) return false;
                 const latest = await this.db.fetchEntryMeta(path, undefined, true);
                 if (!latest || latest._rev !== expectedRevision || latest.deleted || latest._deleted) return false;
                 if ((await this.db.getConflictedRevs(path)).length > 0) return false;
-                if (!await this.currentStorageSnapshotMatches(file, undefined)) return false;
-                if (await provenance.get(path)) return false;
-                await provenance.set(path, { revision: expectedRevision, observedStorageMtime: file.stat.mtime });
+                if (!await this.currentStorageSnapshotMatches(file, observed)) return false;
+                if (!sameProvenance(await provenance.get(provenancePath), observed)) return false;
+                await provenance.set(provenancePath, { revision: expectedRevision, observedStorageMtime: file.stat.mtime, ...evidence });
                 return true;
             });
         } catch (ex) {
@@ -400,10 +477,11 @@ export abstract class ServiceFileHandlerBase
     async storeFileToDB(
         info: UXFileInfoStub | UXFileInfo | UXInternalFileInfoStub | FilePathWithPrefix,
         force: boolean = false,
-        onlyChunks: boolean = false
+        onlyChunks: boolean = false,
+        options: StoreFileOptions = {}
     ): Promise<boolean> {
         return await this.serializedByFileEventPaths([getStoragePathFromUXFileInfo(info)], () =>
-            this.storeFileToDBFromRevision(info, force, onlyChunks)
+            this.storeFileToDBFromRevision(info, force, onlyChunks, undefined, options.revalidateStorage)
         );
     }
 
@@ -461,7 +539,7 @@ export abstract class ServiceFileHandlerBase
         if (!baseEntry.deleted && !baseEntry._deleted) {
             const loadedBase = await this.db.fetchEntry(file, baseRevision, true, true);
             if (loadedBase && (await isDocContentSame(getDocDataAsArray(loadedBase.data), readFile.body))) {
-                await this.setProvenance(file.path, baseRevision, readFile.stat.mtime);
+                await this.setProvenance(file.path, baseRevision, readFile.stat.mtime, readFile.body);
                 await this.queueConflictCheckFor(file.path);
                 return true;
             }
@@ -478,7 +556,7 @@ export abstract class ServiceFileHandlerBase
         if (storedRevision === false) {
             return false;
         }
-        await this.setProvenance(file.path, storedRevision, readFile.stat.mtime);
+        await this.setProvenance(file.path, storedRevision, readFile.stat.mtime, readFile.body);
         await this.queueConflictCheckFor(file.path);
         return true;
     }
@@ -486,8 +564,8 @@ export abstract class ServiceFileHandlerBase
     /**
      * Save one storage snapshot while the caller holds its document lock.
      * Ordinary saves read once inside the lock and leave retries disabled.
-     * Restored startup events retain bounded rereads because file watching has
-     * not yet started and cannot supply a new event for a concurrent edit.
+     * Restored start-up events and recovery scans retain bounded rereads
+     * because a watcher event may not cover a concurrent edit.
      */
     private async storeFileToDBFromRevision(
         info: UXFileInfoStub | UXFileInfo | UXInternalFileInfoStub | FilePathWithPrefix,
@@ -518,10 +596,10 @@ export abstract class ServiceFileHandlerBase
         }
 
         // Keep the storage read and its observed branch together for this save.
-        // Restored startup calls opt into revalidation below because their
-        // persisted event snapshot may be stale; ordinary events use one read.
+        // Recovery calls revalidate potentially stale observations below;
+        // ordinary events use one content read.
         const observedProvenance = await this.readProvenanceSnapshot(
-            (preferredBasePath ?? file.path) as FilePathWithPrefix
+            (preferredBasePath ?? file.path) as FilePathWithPrefix, retryIfStorageChanges
         );
         const readFile = await this.readFileFromStub(file);
         // First, check the file on the database
@@ -530,27 +608,48 @@ export abstract class ServiceFileHandlerBase
         const conflictedRevs = await this.db.getConflictedRevs(file);
         const isConflicted = conflictedRevs.length > 0;
 
-        if (!force && currentEntry && !currentEntry.deleted && !currentEntry._deleted) {
+        const currentIsLive = currentEntry && !currentEntry.deleted && !currentEntry._deleted;
+        // Recovery must classify recorded content even if the database has
+        // advanced to a deletion. Absence alone does not prove a local creation.
+        if (!force && (currentIsLive || retryIfStorageChanges)) {
+            if (retryIfStorageChanges && currentIsLive && !entry) return false;
             const classification = await this.classifyStorageContent(
                 readFile, currentEntry, preferredBasePath, observedProvenance,
-                entry ? { _rev: entry._rev, data: readContent(entry) } : undefined
+                entry ? { _rev: entry._rev, data: readContent(entry) } : undefined,
+                retryIfStorageChanges
             );
-            if (retryIfStorageChanges && !(await this.currentStorageSnapshotMatches(readFile, observedProvenance))) {
+            const upgradeCurrentRecord = classification.kind === "unchanged" && !isConflicted &&
+                currentEntry && !currentEntry.deleted && !currentEntry._deleted &&
+                classification.revision === currentEntry._rev && !hasContentHash(observedProvenance);
+            // Hash before the existing storage check so a restored event can
+            // retry edits made during hashing without another file read.
+            const evidence = upgradeCurrentRecord ||
+                (classification.kind === "matching-leaf" && classification.revision)
+                ? await this.contentEvidence(readFile.body)
+                : undefined;
+            const snapshotMatches = retryIfStorageChanges || upgradeCurrentRecord
+                ? await this.currentStorageSnapshotMatches(readFile, observedProvenance, retryIfStorageChanges)
+                : true;
+            if (retryIfStorageChanges && !snapshotMatches) {
                 return await this.retryCurrentStorage(file.path, preferredBasePath, snapshotRetry);
             }
             if (classification.kind === "unchanged") {
                 if (isConflicted) {
                     await this.queueConflictCheckFor(file.path);
-                } else if (classification.revision !== currentEntry._rev) {
-                    if (!entry) return false;
+                } else if (!currentEntry || currentEntry.deleted || currentEntry._deleted ||
+                    classification.revision !== currentEntry._rev) {
+                    if (!currentEntry) return false;
                     return await this.dbToStorageCore(file.path as FilePathWithPrefix, file);
                 } else {
+                    if (upgradeCurrentRecord && snapshotMatches) {
+                        await this.setProvenance(file.path, classification.revision, readFile.stat.mtime, readFile.body, evidence);
+                    }
                     this.path.markChangesAreSame(readFile, readFile.stat.mtime, currentEntry.mtime);
                 }
                 return true;
             }
             if (classification.kind === "matching-leaf") {
-                await this.rememberMatchingLeaf(file.path, classification.revision, readFile.stat.mtime);
+                await this.rememberMatchingLeaf(file.path, classification.revision, readFile.stat.mtime, readFile.body, evidence);
                 if (isConflicted) await this.queueConflictCheckFor(file.path);
                 return true;
             }
@@ -560,10 +659,10 @@ export abstract class ServiceFileHandlerBase
             if (storedRevision === false) return false;
             if (preferredBasePath && preferredBasePath !== file.path) await this.deleteProvenance(preferredBasePath);
             if (retryIfStorageChanges &&
-                !(await this.finaliseStoredRevision(readFile, observedProvenance, storedRevision))) {
+                !(await this.finaliseStoredRevision(readFile, observedProvenance, storedRevision, true))) {
                 return await this.retryCurrentStorage(file.path, preferredBasePath, snapshotRetry);
             }
-            if (!retryIfStorageChanges) await this.setProvenance(file.path, storedRevision, readFile.stat.mtime);
+            if (!retryIfStorageChanges) await this.setProvenance(file.path, storedRevision, readFile.stat.mtime, readFile.body);
             if (isConflicted || classification.kind === "unknown") await this.queueConflictCheckFor(file.path);
             return true;
         }
@@ -573,7 +672,7 @@ export abstract class ServiceFileHandlerBase
             if (baseRevision) {
                 const baseEntry = await this.db.fetchEntry(file, baseRevision, true, true);
                 if (baseEntry && (await isDocContentSame(getDocDataAsArray(baseEntry.data), readFile.body)) && !force) {
-                    await this.setProvenance(file.path, baseRevision, readFile.stat.mtime);
+                    await this.setProvenance(file.path, baseRevision, readFile.stat.mtime, readFile.body);
                     this._log(`File ${file.path} is not changed on its displayed conflict branch`, LOG_LEVEL_VERBOSE);
                     return true;
                 }
@@ -582,7 +681,7 @@ export abstract class ServiceFileHandlerBase
                 if (preferredBasePath && preferredBasePath !== file.path) {
                     await this.deleteProvenance(preferredBasePath);
                 }
-                await this.setProvenance(file.path, storedRevision, readFile.stat.mtime);
+                await this.setProvenance(file.path, storedRevision, readFile.stat.mtime, readFile.body);
                 await this.queueConflictCheckFor(file.path);
                 return true;
             }
@@ -608,7 +707,7 @@ export abstract class ServiceFileHandlerBase
             if (preferredBasePath && preferredBasePath !== file.path) {
                 await this.deleteProvenance(preferredBasePath);
             }
-            await this.setProvenance(file.path, storedRevision, readFile.stat.mtime);
+            await this.setProvenance(file.path, storedRevision, readFile.stat.mtime, readFile.body);
             await this.queueConflictCheckFor(file.path);
             return true;
         }
@@ -620,7 +719,7 @@ export abstract class ServiceFileHandlerBase
             if (preferredBasePath && preferredBasePath !== file.path) {
                 await this.deleteProvenance(preferredBasePath);
             }
-            await this.setProvenance(file.path, storedRevision, readFile.stat.mtime);
+            await this.setProvenance(file.path, storedRevision, readFile.stat.mtime, readFile.body);
             return true;
         }
 
@@ -647,7 +746,7 @@ export abstract class ServiceFileHandlerBase
             }
 
             if (!shouldApplied) {
-                await this.setProvenance(file.path, entry._rev, readFile.stat.mtime);
+                await this.setProvenance(file.path, entry._rev, readFile.stat.mtime, readFile.body);
                 this._log(`File ${file.path} is not changed`, LOG_LEVEL_VERBOSE);
                 return true;
             }
@@ -657,7 +756,7 @@ export abstract class ServiceFileHandlerBase
         if (preferredBasePath && preferredBasePath !== file.path) {
             await this.deleteProvenance(preferredBasePath);
         }
-        await this.setProvenance(file.path, storedRevision, readFile.stat.mtime);
+        await this.setProvenance(file.path, storedRevision, readFile.stat.mtime, readFile.body);
         return true;
     }
 
@@ -665,6 +764,13 @@ export abstract class ServiceFileHandlerBase
         return await this.serializedByFileEventPaths([getStoragePathFromUXFileInfo(info)], () =>
             this.deleteFileFromDBCore(info)
         );
+    }
+
+    /** Complete a validated storage deletion when its database effect is already represented. */
+    private async deleteFileFromDBIfPresent(info: UXFileInfoStub | UXInternalFileInfoStub | FilePath): Promise<boolean> {
+        const entry = await this.db.fetchEntryMeta(info, undefined, true);
+        if (!entry || entry.deleted || entry._deleted) return true;
+        return await this.deleteFileFromDBCore(info);
     }
 
     /**
@@ -1081,20 +1187,36 @@ export abstract class ServiceFileHandlerBase
                 );
                 return false;
             }
-            if (getParentPath(existDoc.path) !== getParentPath(path)) {
-                this._log(
-                    `Refusing to apply a filename case change across differently cased parent directories: ${existDoc.path} -> ${path}`,
-                    LOG_LEVEL_NOTICE
-                );
-                return false;
+            const pathNormalizationVersion = getPathNormalizationVersion(settings);
+            const sameNormalisedPath =
+                pathNormalizationVersion === 1 &&
+                normalisePathForIdentity(existDoc.path, pathNormalizationVersion) ===
+                    normalisePathForIdentity(path, pathNormalizationVersion);
+            if (!sameNormalisedPath) {
+                const existingParent = getParentPath(existDoc.path);
+                const targetParent = getParentPath(path);
+                const sameNormalisedParent =
+                    pathNormalizationVersion === 1 &&
+                    normalisePathForIdentity(existingParent, pathNormalizationVersion) ===
+                        normalisePathForIdentity(targetParent, pathNormalizationVersion);
+                if (existingParent !== targetParent && !sameNormalisedParent) {
+                    this._log(
+                        `Refusing to apply a filename case change across differently cased parent directories: ${existDoc.path} -> ${path}`,
+                        LOG_LEVEL_NOTICE
+                    );
+                    return false;
+                }
+                const renamedFile = await this.storage.renameFile(existDoc, path);
+                if (!renamedFile) {
+                    this._log(
+                        `Could not apply the stored filename case: ${existDoc.path} -> ${path}`,
+                        LOG_LEVEL_NOTICE
+                    );
+                    return false;
+                }
+                await this.deleteProvenance(existDoc.path);
+                existDoc = renamedFile;
             }
-            const renamedFile = await this.storage.renameFile(existDoc, path);
-            if (!renamedFile) {
-                this._log(`Could not apply the stored filename case: ${existDoc.path} -> ${path}`, LOG_LEVEL_NOTICE);
-                return false;
-            }
-            await this.deleteProvenance(existDoc.path);
-            existDoc = renamedFile;
         }
         // Okay, the file is exist on the database. Let's check the file is exist on the storage.
         const docRead = await this.db.fetchEntryFromMeta(docEntry);
@@ -1102,25 +1224,27 @@ export abstract class ServiceFileHandlerBase
             this._log(`File ${path} is not exist on the database`, LOG_LEVEL_VERBOSE);
             return false;
         }
+        const docData = readContent(docRead);
+        const reflectedContent = createBlob(docData);
         // If we want to process size mismatched files -- in case of having files created by some integrations, enable the toggle.
         if (!settings.processSizeMismatchedFiles) {
             // Check the file is not corrupted
             // (Zero is a special case, may be created by some APIs and it might be acceptable).
-            if (docRead.size != 0 && docRead.size !== readAsBlob(docRead).size) {
+            if (docRead.size != 0 && docRead.size !== reflectedContent.size) {
                 this._log(
-                    `File ${path} seems to be corrupted! Writing prevented. (${docRead.size} != ${readAsBlob(docRead).size})`,
+                    `File ${path} seems to be corrupted! Writing prevented. (${docRead.size} != ${reflectedContent.size})`,
                     LOG_LEVEL_NOTICE
                 );
                 return false;
             }
         }
 
-        const docData = readContent(docRead);
+        const reflectedEvidence = await this.contentEvidence(reflectedContent);
 
         if (allowExistingConflicts && existDoc && !force) {
             const readFile = await this.readFileFromStub(existDoc);
             if (await isDocContentSame(docData, readFile.body)) {
-                await this.setProvenance(path, docEntry._rev, existDoc.stat.mtime);
+                await this.setProvenance(path, docEntry._rev, existDoc.stat.mtime, reflectedContent, reflectedEvidence);
                 this.path.markChangesAreSame(docRead, docRead.mtime, existDoc.stat.mtime);
                 return true;
             }
@@ -1158,7 +1282,7 @@ export abstract class ServiceFileHandlerBase
                 }
             }
             if (!shouldApplied) {
-                await this.setProvenance(path, docEntry._rev, existDoc.stat.mtime);
+                await this.setProvenance(path, docEntry._rev, existDoc.stat.mtime, reflectedContent, reflectedEvidence);
                 this._log(`File ${docRead.path} is not changed`, LOG_LEVEL_VERBOSE);
                 return true;
             }
@@ -1205,10 +1329,10 @@ export abstract class ServiceFileHandlerBase
             // Preserve that newer branch identity. A plain user edit leaves the
             // record unchanged, so the written revision remains its correct base.
             if (safeSnapshot &&
-                (await this.readProvenanceSnapshot(path)) !== safeSnapshot.revision) {
+                !sameProvenance(await this.readProvenanceSnapshot(path), safeSnapshot.revision)) {
                 return ret;
             }
-            await this.setProvenance(path, docEntry._rev, storedStat?.mtime);
+            await this.setProvenance(path, docEntry._rev, storedStat?.mtime, reflectedContent, reflectedEvidence);
         }
         return ret;
     }
@@ -1255,7 +1379,7 @@ export abstract class ServiceFileHandlerBase
             return { preserved: false, snapshot };
         }
         if (classification.kind === "matching-leaf") {
-            await this.rememberMatchingLeaf(path, classification.revision, readFile.stat.mtime);
+            await this.rememberMatchingLeaf(path, classification.revision, readFile.stat.mtime, readFile.body);
             await this.queueConflictCheckFor(path);
             return { preserved: true };
         }
@@ -1331,8 +1455,8 @@ export abstract class ServiceFileHandlerBase
         if (item.restoredFromPreviousRuntime) {
             return await this._processRestoredFileEvent(item);
         }
-        // Ordinary watcher events use their captured event snapshot. Restored
-        // events are persisted intentions and are reread and revalidated below.
+        // Acquire ordinary content only when its queued operation runs. Restored
+        // events also revalidate their persisted deletion and rename intentions.
         const eventItem = item.args;
         const type = item.type;
         const path = eventItem.file.path;
@@ -1343,14 +1467,25 @@ export abstract class ServiceFileHandlerBase
         const relatedPath = type === "RENAME" ? eventItem.oldPath : type === "DELETE" ? eventItem.renameTarget : undefined;
         const eventPaths = relatedPath === undefined ? [path] : [path, relatedPath as FilePathWithPrefix];
         return await this.serializedByFileEventPaths(eventPaths, async () => {
-            if (!(await this.isCurrentPathSelected(path))) return false;
+            if (!(await this.isCurrentPathSelected(path))) {
+                return shouldBeIgnored(path) || !(await this.vault.isTargetFile(path, { skipCaseCollisionCheck: true }));
+            }
             switch (type) {
                 case "CREATE":
-                case "CHANGED":
-                    return await this.storeFileToDBFromRevision(item.args.file);
+                case "CHANGED": {
+                    const current = this.getExactCurrentFile(await this.storage.getStub(path), path);
+                    // A later deletion or move can supersede a queued content
+                    // event before its body is acquired. Inspection errors still fail.
+                    if (!current || this.vault.isFileSizeTooLarge(current.stat.size)) return true;
+                    return await this.storeFileToDBFromRevision(current);
+                }
                 case "DELETE":
-                    if (!(await this.canRecordStorageDeletion(item))) return true;
-                    return await this.deleteFileFromDBCore(item.args.file);
+                    try {
+                        if (!(await this.canRecordStorageDeletion(item))) return true;
+                    } catch {
+                        return false;
+                    }
+                    return await this.deleteFileFromDBIfPresent(item.args.file);
                 case "RENAME":
                     return await this.renameFileInDBCore(
                         item.args.file as UXFileInfoStub,
@@ -1413,7 +1548,7 @@ export abstract class ServiceFileHandlerBase
         } catch (ex) {
             this._log(`Could not validate deletion of ${path}; preserved the database entry`, LOG_LEVEL_NOTICE);
             this._log(ex, LOG_LEVEL_VERBOSE);
-            return false;
+            throw ex;
         }
     }
 
@@ -1508,16 +1643,20 @@ export abstract class ServiceFileHandlerBase
                 action = await this._planRestoredFileEvent(item, isSameDocument);
             } catch (ex) {
                 this.logRestoredEventValidationFailure(path, ex);
-                return true;
+                return false;
             }
 
             switch (action.kind) {
                 case "none":
                     return true;
-                case "store":
-                    return await this.storeFileToDBFromRevision(action.file, false, false, undefined, true);
+                case "unresolved":
+                    return false;
+                case "store": {
+                    const stored = await this.storeFileToDBFromRevision(action.file, false, false, undefined, true);
+                    return stored && action.complete !== false;
+                }
                 case "delete":
-                    return await this.deleteFileFromDBCore(action.path);
+                    return await this.deleteFileFromDBIfPresent(action.path);
                 case "rename":
                     return await this.renameFileInDBCore(action.file, action.oldPath, true);
             }
@@ -1568,6 +1707,11 @@ export abstract class ServiceFileHandlerBase
             if (!currentTarget || !(await this.isCurrentFileSelected(currentTarget))) {
                 return { kind: "none" };
             }
+            const entry = await this.db.fetchEntryMeta(newPath, undefined, true);
+            if (entry && !entry.deleted && !entry._deleted &&
+                this.storage.normalisePath(this.getPath(entry)) === this.storage.normalisePath(newPath)) {
+                return { kind: "store", file: currentTarget };
+            }
             return { kind: "rename", file: currentTarget, oldPath };
         }
 
@@ -1586,12 +1730,19 @@ export abstract class ServiceFileHandlerBase
                 return { kind: "none" };
             }
             if (!sourceWasInspected || currentSourceItem !== null || !(await this.canApplyRestoredDeletion(oldPath))) {
+                return { kind: "store", file: currentTarget, complete: sourceWasInspected };
+            }
+            const sourceEntry = await this.db.fetchEntryMeta(oldPath, undefined, true);
+            if (!sourceEntry || sourceEntry.deleted || sourceEntry._deleted) {
+                // The source deletion is already represented. Reconcile the
+                // current target without forcing another rename revision.
                 return { kind: "store", file: currentTarget };
             }
             return { kind: "rename", file: currentTarget, oldPath };
         }
 
-        if (!sourceWasInspected || currentSourceItem !== null || !(await this.canApplyRestoredDeletion(oldPath))) {
+        if (!sourceWasInspected) return { kind: "unresolved" };
+        if (currentSourceItem !== null || !(await this.canApplyRestoredDeletion(oldPath))) {
             return { kind: "none" };
         }
         return { kind: "delete", path: oldPath as FilePath };
@@ -1635,13 +1786,13 @@ export abstract class ServiceFileHandlerBase
             return await this.isCurrentPathSelected(path);
         } catch (ex) {
             this.logRestoredEventValidationFailure(path, ex);
-            return false;
+            throw ex;
         }
     }
 
     private logRestoredEventValidationFailure(path: FilePathWithPrefix, ex: unknown): void {
         this._log(
-            `Could not validate the saved storage operation for ${path} against current storage; the Offline Scanner will reconcile the current state`,
+            `Could not validate the saved storage operation for ${path} against current storage; the operation remains pending for recovery`,
             LOG_LEVEL_NOTICE
         );
         this._log(ex, LOG_LEVEL_VERBOSE);

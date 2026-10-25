@@ -20,8 +20,10 @@ import {
 
 import { compareMTime, isAnyNote, isRemediationModeActive } from "@lib/common/utils";
 import { shouldBeIgnored, stripAllPrefixes } from "@lib/string_and_binary/path";
+import { getPathNormalizationVersion, normalisePathForIdentity } from "@lib/common/pathNormalization";
 import { createInstanceLogFunction, type LogFunction } from "@lib/services/lib/logUtils";
 import type { NecessaryServices } from "@lib/interfaces/ServiceModule";
+import type { IPathService } from "@lib/services/base/IService";
 import { BASE_IS_NEW, EVEN, TARGET_IS_NEW } from "@lib/common/models/shared.const.symbols";
 import { UnresolvedErrorManager } from "@lib/services/base/UnresolvedErrorManager";
 import { compatGlobal } from "@lib/common/coreEnvFunctions";
@@ -155,7 +157,7 @@ export function getMetadataDocumentNamespace(value: string): MetadataDocumentNam
  * through ordinary path-based handling.
  */
 export async function inspectMetadataDocumentIdentity(
-    host: NecessaryServices<"path", never>,
+    host: { services: { path: Pick<IPathService, "getPath" | "path2id"> } },
     doc: MetaEntry
 ): Promise<MetadataDocumentIdentityInspection> {
     const actualDocumentId = doc._id;
@@ -595,7 +597,10 @@ export async function collectDeletedFiles(
  * @param doc Meta entry document
  * @returns Path string
  */
-export function getPathFromEntry(host: NecessaryServices<"path", never>, doc: MetaEntry): FilePathWithPrefix {
+export function getPathFromEntry(
+    host: { services: { path: Pick<IPathService, "getPath"> } },
+    doc: MetaEntry
+): FilePathWithPrefix {
     const path = host.services.path.getPath(doc);
     return path;
 }
@@ -624,8 +629,9 @@ export async function syncFileBetweenDBandStorage(
         case BASE_IS_NEW:
             if (!host.services.vault.isFileSizeTooLarge(file.stat.size)) {
                 log("STORAGE -> DB :" + file.path);
-                await host.serviceModules.fileHandler.storeFileToDB(file);
-                return FilePairProcessResults.COMPLETED;
+                return (await host.serviceModules.fileHandler.storeFileToDB(file))
+                    ? FilePairProcessResults.COMPLETED
+                    : FilePairProcessResults.FAILED;
             } else {
                 log(
                     `STORAGE -> DB : ${file.path} has been skipped due to file size exceeding the limit`,
@@ -654,11 +660,24 @@ export async function syncFileBetweenDBandStorage(
                 return FilePairProcessResults.SKIPPED;
             }
         case EVEN:
-            if (doc._rev) {
-                await host.serviceModules.fileHandler.tryRecordUntrackedFileRevision(file, doc._rev);
+            if (host.services.vault.isFileSizeTooLarge(file.stat.size) || host.services.vault.isFileSizeTooLarge(doc.size)) {
+                log(`STORAGE ? DB : ${file.path} has been skipped due to file size exceeding the limit`, LOG_LEVEL_NOTICE);
+                return FilePairProcessResults.SKIPPED;
             }
-            log("STORAGE == DB :" + file.path + "", LOG_LEVEL_DEBUG);
-            return FilePairProcessResults.COMPLETED;
+            if (doc._rev && (await host.serviceModules.fileHandler.tryRecordUntrackedFileRevision(file, doc._rev))) {
+                log("STORAGE == DB :" + file.path, LOG_LEVEL_DEBUG);
+                return FilePairProcessResults.COMPLETED;
+            }
+            log("STORAGE ? DB :" + file.path + " Checking content", LOG_LEVEL_DEBUG);
+            try {
+                return (await host.serviceModules.fileHandler.storeFileToDB(file, false, false, { revalidateStorage: true }))
+                    ? FilePairProcessResults.COMPLETED
+                    : FilePairProcessResults.FAILED;
+            } catch (error) {
+                log(`STORAGE ? DB : Could not reconcile ${file.path}`, LOG_LEVEL_NOTICE);
+                log(error, LOG_LEVEL_VERBOSE);
+                return FilePairProcessResults.FAILED;
+            }
         default:
             log("STORAGE ?? DB :" + file.path + " Something got weird");
             return FilePairProcessResults.FAILED;
@@ -705,7 +724,7 @@ export function canProceedScan(
 }
 
 /**
- * Convert file path to lower case if the settings indicate that filename case should be handled insensitively.
+ * Normalise the logical comparison key and lower case it when filename case should be handled insensitively.
  * @param settings
  * @param path
  * @returns
@@ -714,10 +733,11 @@ export function convertCase<T extends FilePathWithPrefix>(
     settings: ObsidianLiveSyncSettings,
     path: T
 ): FilePathWithPrefixLC {
+    const normalisedPath = normalisePathForIdentity(path, getPathNormalizationVersion(settings));
     if (settings.handleFilenameCaseSensitive) {
-        return path as FilePathWithPrefixLC;
+        return normalisedPath as FilePathWithPrefixLC;
     }
-    return (path as string).toLowerCase() as FilePathWithPrefixLC;
+    return normalisedPath.toLowerCase() as FilePathWithPrefixLC;
 }
 
 export async function collectFilesOnStorage(
@@ -834,7 +854,9 @@ export async function updateToDatabase(
 ): Promise<FilePairProcessResult> {
     if (!host.services.vault.isFileSizeTooLarge(file.stat.size)) {
         const path = file.path;
-        await host.serviceModules.fileHandler.storeFileToDB(file);
+        if (!(await host.serviceModules.fileHandler.storeFileToDB(file))) {
+            return FilePairProcessResults.FAILED;
+        }
         host.services.context.events.emitEvent("event-file-changed", { file: path, automated: true });
         return FilePairProcessResults.COMPLETED;
     } else {

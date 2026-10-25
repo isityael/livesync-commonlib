@@ -1,5 +1,7 @@
 import {
     type EntryMilestoneInfo,
+    NODEINFO_DOCID,
+    type EntryNodeInfo,
     type RemoteDBSettings,
     LOG_LEVEL_NOTICE,
     type ChunkVersionRange,
@@ -24,6 +26,7 @@ import type { CheckPointInfo } from "./JournalSyncTypes.ts";
 import type { SimpleStore } from "@lib/common/utils.ts";
 
 import { getEffectiveTweakValues } from "@lib/pouchdb/LiveSyncDBFunctions.ts";
+import { getPathNormalizationVersion } from "@lib/common/pathNormalization.ts";
 import type { LiveSyncJournalReplicatorEnv } from "./LiveSyncJournalReplicatorEnv.ts";
 import { JournalStorageReadStatuses } from "./objectstore/JournalStorageAdapter.ts";
 import { computeKeyedId, configuredIdKey } from "@lib/common/idDerivation.ts";
@@ -42,6 +45,13 @@ import {
     replicationFailed,
     type ReplicationOutcome,
 } from "@lib/replication/ReplicatorProvider.ts";
+import {
+    forgetJoinedDevice as forgetJoinedDeviceFromStore,
+    projectJoinedDevices,
+    type ForgetJoinedDeviceResult,
+    type JoinedDevicesSnapshot,
+    type JoinedDevicesStore,
+} from "@lib/replication/joinedDevices.ts";
 
 const MILSTONE_DOCID = "_00000000-milestone.json";
 
@@ -92,6 +102,7 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
     }
 
     setupJournalSyncClient(settings: RemoteDBSettings = this.currentSettings) {
+        this.assertLegacyPathIdentity(settings);
         if (this._client) {
             this._client.applyNewConfig(settings, this.simpleStore, this.env);
         } else {
@@ -159,6 +170,7 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
                 vault_name: this.env.services.vault.vaultName(),
                 device_name: this.env.services.vault.getVaultName(),
                 progress: progress,
+                platform: this.env.services.API.getPlatform(),
             },
             async (info) => {
                 if (encryptedProof) info.encrypted_id_derivation_proof = encryptedProof;
@@ -371,16 +383,18 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
         ignoreCleanLock = false,
         showMessage = false,
         setting: RemoteDBSettings = this.currentSettings,
-        client: JournalSyncCore = this.setupJournalSyncClient(setting),
+        client?: JournalSyncCore,
         recordCompatibilityDecision?: CentralCompatibilityDecisionRecorder
     ) {
         recordCompatibilityDecision?.(CENTRAL_COMPATIBILITY_NOT_ASSESSED);
-        if (!(await client.isAvailable())) {
+        if (!this.supportsLegacyPathIdentity(setting)) return false;
+        const activeClient = client ?? this.setupJournalSyncClient(setting);
+        if (!(await activeClient.isAvailable())) {
             return false;
         }
         if (!skipCheck) {
             // Keep compatibility result semantics strict: epoch/cache policy is handled as a separate preflight.
-            await client.ensureCheckpointCachesAreFresh();
+            await activeClient.ensureCheckpointCachesAreFresh();
             this.remoteCleaned = false;
             this.remoteLocked = false;
             this.remoteLockedAndDeviceNotAccepted = false;
@@ -391,7 +405,7 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
                 this.nodeid,
                 journalVersionRange(setting),
                 setting,
-                client,
+                activeClient,
                 (assessment) => {
                     tweakAssessment = assessment;
                 }
@@ -477,6 +491,7 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
     }
 
     async tryResetRemoteDatabase(setting: RemoteDBSettings) {
+        this.assertLegacyPathIdentity(setting);
         this.closeReplication();
         try {
             if (!(await this.client.resetBucket())) {
@@ -492,6 +507,7 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
     }
 
     async tryCreateRemoteDatabase(setting: RemoteDBSettings) {
+        this.assertLegacyPathIdentity(setting);
         this.closeReplication();
         Logger("Remote Database Created or Connected", LOG_LEVEL_NOTICE);
         if (!(await this.ensurePBKDF2Salt(setting, true, false))) {
@@ -508,6 +524,7 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
     }
 
     async markRemoteLocked(setting: RemoteDBSettings, locked: boolean, lockByClean: boolean) {
+        this.assertLegacyPathIdentity(setting);
         const defInitPoint: EntryMilestoneInfo = {
             _id: MILSTONE_DOCID as DocumentID,
             type: "milestoneinfo",
@@ -542,6 +559,7 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
         }
     }
     async markRemoteResolved(setting: RemoteDBSettings) {
+        this.assertLegacyPathIdentity(setting);
         const defInitPoint: EntryMilestoneInfo = {
             _id: MILSTONE_DOCID as DocumentID,
             type: "milestoneinfo",
@@ -571,8 +589,10 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
 
     async tryConnectRemote(setting: RemoteDBSettings, showResult: boolean = true): Promise<boolean> {
         const endpoint = setting.endpoint;
-        const testClient = new MinioStorageAdapter(setting, this.env);
+        let testClient: MinioStorageAdapter | undefined;
         try {
+            this.assertLegacyPathIdentity(setting);
+            testClient = new MinioStorageAdapter(setting, this.env);
             await testClient.listFiles("", 1);
             Logger(`Connected to ${endpoint} successfully!`, LOG_LEVEL_NOTICE);
             return true;
@@ -581,11 +601,12 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
             Logger(ex, LOG_LEVEL_NOTICE);
             return false;
         } finally {
-            testClient.dispose();
+            testClient?.dispose();
         }
     }
 
     async resetRemoteTweakSettings(setting: RemoteDBSettings) {
+        this.assertLegacyPathIdentity(setting);
         try {
             const remoteMilestone = await this.client.downloadJson<EntryMilestoneInfo>(MILSTONE_DOCID);
             if (!remoteMilestone) {
@@ -601,6 +622,7 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
     }
 
     async setPreferredRemoteTweakSettings(setting: RemoteDBSettings): Promise<void> {
+        this.assertLegacyPathIdentity(setting);
         // Preferred-tweak writes are finite trial-settings operations. Do not
         // borrow or reconfigure the active Journal client.
         const trialClient = new JournalSyncCore(
@@ -628,6 +650,7 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
     }
 
     async getRemotePreferredTweakValues(setting: RemoteDBSettings): Promise<RemotePreferredTweakResult> {
+        this.assertLegacyPathIdentity(setting);
         // Preferred-tweak inspection is a finite trial-settings operation. Do
         // not borrow or reconfigure the active Journal client.
         const trialClient = new JournalSyncCore(
@@ -667,11 +690,75 @@ export class LiveSyncJournalReplicator extends LiveSyncAbstractReplicator {
     }
 
     async getRemoteStatus(setting: RemoteDBSettings): Promise<false | RemoteDBStatus> {
+        this.assertLegacyPathIdentity(setting);
         const testClient = new MinioStorageAdapter(setting, this.env);
         try {
             return await testClient.getUsage();
         } finally {
             testClient.dispose();
+        }
+    }
+
+    private supportsLegacyPathIdentity(setting: RemoteDBSettings): boolean {
+        return getPathNormalizationVersion(setting) === 0;
+    }
+
+    private assertLegacyPathIdentity(setting: RemoteDBSettings): void {
+        if (!this.supportsLegacyPathIdentity(setting)) {
+            throw new Error("Object Storage does not support NFC path identity.");
+        }
+    }
+
+    private async getOwnJoinedDeviceId(): Promise<string> {
+        const nodeInfo = await this.rawDatabase.get<EntryNodeInfo>(NODEINFO_DOCID);
+        const nodeId = nodeInfo?.nodeid;
+        if (typeof nodeId !== "string" || nodeId.trim().length === 0) {
+            throw new Error("The local node identity is unavailable.");
+        }
+        return nodeId;
+    }
+
+    async getJoinedDevices(setting: RemoteDBSettings): Promise<JoinedDevicesSnapshot> {
+        this.assertLegacyPathIdentity(setting);
+        const trialClient = new JournalSyncCore(
+            setting,
+            this.simpleStore,
+            this.env,
+            new MinioStorageAdapter(setting, this.env)
+        );
+        try {
+            const result = await trialClient.downloadJsonWithResult<EntryMilestoneInfo>(MILSTONE_DOCID);
+            if (result.status === JournalStorageReadStatuses.NOT_FOUND) return projectJoinedDevices(undefined);
+            if (result.status === JournalStorageReadStatuses.UNAVAILABLE) throw result.error;
+            return projectJoinedDevices(result.value);
+        } finally {
+            trialClient.dispose();
+        }
+    }
+
+    async forgetJoinedDevice(setting: RemoteDBSettings, deviceId: string): Promise<ForgetJoinedDeviceResult> {
+        this.assertLegacyPathIdentity(setting);
+        const ownDeviceId = await this.getOwnJoinedDeviceId();
+        const trialClient = new JournalSyncCore(
+            setting,
+            this.simpleStore,
+            this.env,
+            new MinioStorageAdapter(setting, this.env)
+        );
+        try {
+            const store: JoinedDevicesStore = {
+                read: async () => {
+                    const result = await trialClient.downloadJsonWithResult<EntryMilestoneInfo>(MILSTONE_DOCID);
+                    if (result.status === JournalStorageReadStatuses.NOT_FOUND) return undefined;
+                    if (result.status === JournalStorageReadStatuses.UNAVAILABLE) throw result.error;
+                    return { milestone: result.value, revision: result.revision };
+                },
+                write: async (milestone, revision) =>
+                    await trialClient.uploadJsonIfUnchanged(MILSTONE_DOCID, milestone, revision),
+            };
+            return await forgetJoinedDeviceFromStore(store, deviceId, ownDeviceId);
+        } finally {
+            trialClient.dispose();
         }
     }
 
