@@ -90,7 +90,7 @@
         "tinyglobby": "^0.2.17",
         "typescript": "7.1.0-dev.20261022.1",
         "vitest": "^5.0.4",
-        "typescript-compiler-api": "npm:typescript@6.0.3"
+        "typescript-compiler-api": "npm:typescript@7.0.2"
     },
     "engines": {
         "node": ">=20"
