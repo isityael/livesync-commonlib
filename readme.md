@@ -14,11 +14,18 @@ This package is primarily for maintainers of those clients and for integrations 
 
 ## Status and versioning
 
-The package is pre-1.0. Pin an exact reviewed version, and review changes before upgrading. An entry in the package export map means that the import is deliberate and package-tested; it does not make every semantic detail of that entry a final 1.0 guarantee.
+Commonlib is pre-1.0. The compatibility policy described here begins with 0.2.0 and does not retroactively apply to published 0.1.x versions. Within 0.2.x, Commonlib preserves published APIs, types, behaviour, supported persisted data, and exported `compat/*` paths; intentional breaking changes use 0.3.0. Consumers may declare ranges such as `^0.2.0`; retain a lockfile and use `npm ci` for reproducible installs. An entry in the package export map means that the import is deliberate and package-tested; it does not make every semantic detail of that entry a final 1.0 guarantee.
 
 Treat every `compat/*` subpath as a migration-only interface. A source-directory import, Git submodule, or consumer-defined TypeScript alias is not a supported package boundary.
 
 The package is ESM-only and declares Node 20 or later. Browser entry points are built with browser conditions, but the host remains responsible for checking the availability of browser capabilities such as the File System Access API.
+
+Fast Fetch imports all current leaf revisions listed by CouchDB, including
+deleted conflict leaves. A host may supply the optional
+`initial-fetch-fast-forward` resource to hand a fresh, complete import to
+ordinary replication before resuming local writers. Existing hosts can omit
+this optimisation. Resume cursors retain their existing meaning; this resource
+does not provide an arbitrary-time checkpoint jump or On Demand repair.
 
 ## Package entry points
 
@@ -26,7 +33,8 @@ The package is ESM-only and declares Node 20 or later. Browser entry points are 
 | -------------------------------------------------- | --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
 | `@vrtmrz/livesync-commonlib`                       | `DirectFileManipulator` for integrations which access CouchDB directly            | Deliberately small, but its high-level lifecycle and file-operation semantics are not final |
 | `@vrtmrz/livesync-commonlib/context`               | Instance-owned events, translation injection, and host-neutral standard-I/O types | Focused, package-tested pre-1.0 contract                                                    |
-| `@vrtmrz/livesync-commonlib/hashing`               | Chunk ID calculation with the database's hash manager                            | Focused, package-tested pre-1.0 contract                                                    |
+| `@vrtmrz/livesync-commonlib/diagnostics` | Read-only Usage and integrity inspection, name projection, and reports | Focused pre-1.0 diagnostic contract |
+| `@vrtmrz/livesync-commonlib/hashing`               | Chunk ID calculation and exact file-content hashing                            | Focused, package-tested pre-1.0 contract                                                    |
 | `@vrtmrz/livesync-commonlib/browser`               | Rooted File System Access API storage                                             | Focused, package-tested pre-1.0 contract                                                    |
 | `@vrtmrz/livesync-commonlib/node`                  | Rooted Node storage, Node standard I/O, and selected Node capabilities            | Supported platform façade; keeps Node-only dependencies behind an explicit boundary         |
 | `@vrtmrz/livesync-commonlib/p2p`                   | Host-composed P2P service views and composition helpers                           | Focused, package-tested pre-1.0 contract with a temporary compatibility façade              |
@@ -35,7 +43,8 @@ The package is ESM-only and declares Node 20 or later. Browser entry points are 
 | `@vrtmrz/livesync-commonlib/remote-configurations` | Multiple-remote profile creation, naming, and selection                           | Focused, package-tested pre-1.0 contract                                                    |
 | `@vrtmrz/livesync-commonlib/settings`              | New-Vault defaults, stored-setting fallbacks, and settings migration results      | Focused, package-tested pre-1.0 contract                                                    |
 | `@vrtmrz/livesync-commonlib/setup-uri`             | Encrypted Setup URI generation, availability, and import                          | Focused, package-tested pre-1.0 contract                                                    |
-| `@vrtmrz/livesync-commonlib/compat/*`              | Exact legacy imports still required by existing clients                           | Migration-only; paths may be removed as consumers migrate                                   |
+| `@vrtmrz/livesync-commonlib/ui-commands` | Instance-owned typed UI command declarations and handlers | Focused, package-tested contract |
+| `@vrtmrz/livesync-commonlib/compat/*`              | Exact legacy imports still required by existing clients                           | Migration-only; retained within 0.2.x, with removals treated as 0.3.0 breaking changes       |
 | `@vrtmrz/livesync-commonlib/package.json`          | Package metadata for tooling                                                      | Metadata export, not a runtime API                                                          |
 
 Import only the entry point required by the current runtime. Browser code must not import the Node entry.
@@ -73,6 +82,74 @@ Context construction does not select storage, connect to a database, start repli
 After the Self-hosted LiveSync 1.0 work, the planned high-level composition is a narrow `createLiveSyncFileClient` factory for direct database integrations, not a general factory which exposes Commonlib's internal Service Hub. It will resolve only after its private context, services, database, and protocol settings are ready, and its returned file client will own its watches, reconnect work, and orderly disposal. Obsidian, CLI, Webapp, and other full hosts retain their host-specific compositions.
 
 The factory is not implemented yet. Until it is available, service implementations exposed under `compat/*` retain their owning client's lifecycle rather than becoming a general public composition API.
+
+## UI commands
+
+Import `declareUICommand` and `UICommandRegistry` from `@vrtmrz/livesync-commonlib/ui-commands`. A declaration binds a stable command ID to its request and result types. Each `UIService` owns its own `commands` registry; declarations do not register global handlers.
+
+```ts
+import { declareUICommand } from "@vrtmrz/livesync-commonlib/ui-commands";
+
+const showDevices = declareUICommand<void, 'closed'>('example:show-devices');
+const unregister = services.UI.commands.register(showDevices, async () => {
+    await openHostDeviceDialogue();
+    return 'closed';
+});
+const result = await services.UI.commands.invoke(showDevices, undefined);
+// result is { status: 'handled', value: 'closed' } or { status: 'unavailable' }.
+unregister();
+```
+
+A feature releases its handler when it unloads. The host dialogue owner remains responsible for active UI work. Duplicate handlers and conflicting declarations with the same ID are rejected; handler failures propagate. Calling an unavailable or disposed registry settles immediately. `UIService` disposes its registry on the context's plug-in-unloaded event.
+
+## Joined device records
+
+The `/replication` entry includes the `joined-devices` finite resource contract. A provider binds each resource to one settings snapshot; its owner calls `dispose()` in `finally`. `read()` returns recorded device IDs, acceptance, versions, platform, and connection times where available. An absent milestone is explicit. Joined-device operations never initialise a missing CouchDB database. These records do not establish online presence.
+
+`forget(id)` removes one other device from all participation maps and the accepted list, while retaining the lock state, preferred tweaks, and unknown fields. The CouchDB implementation rereads the existing milestone before editing and verifies removal after saving. CouchDB local documents do not reject stale revisions, so concurrent changes to other device records can be overwritten. A failed verification is reported to the caller for manual refresh and retry. Object Storage checks ETags with conditional writes and retries conflicts a bounded number of times. Missing records, unsupported conditional writes, and exhausted conflicts have distinct results. Forgetting is not credential revocation: an unlocked remote permits a returning device to register again.
+
+## Replication statistics
+
+Hosts can read the latest `services.replicator.replicationStatics.value` and
+subscribe to that reactive source. The focused `/replication` entry exports
+`ReplicationStatics`, `CouchDBReplicationProgress`, and
+`ReplicationCheckpointProgress`. Existing transfer counters and `syncStatus`
+retain their meanings.
+
+The optional `couchDB` snapshot describes the ordinary CouchDB replication
+attempt. Other providers omit it. Its `phase` distinguishes `one-shot`,
+`catch-up` (the pull preceding each continuous start or reconnect),
+`continuous`, and `idle`. Preparation can expose a phase before directional
+progress is available. This is independent of activity, pause, or failure in
+`syncStatus`; entering `continuous` does not establish that Vault reflection
+has finished or that editing is safe.
+
+Optional `pull` and `push` observations each contain:
+
+- `checkedChanges`: changes-feed entries presented for revision comparison,
+  including both existing and missing revisions. One entry with several
+  revisions counts once; repeated entries during retries can count again.
+  This is neither a Vault file count nor an exact count of skipped transfers.
+- `completedBatches`: batches which reached PouchDB's checkpoint notification,
+  including batches which transferred no documents.
+- `lastSeq`: the last processed checkpoint position, preserved as a number or
+  an opaque string. It is not a remaining-work estimate, percentage, or proof
+  that a checkpoint was durably written.
+- `checking`: observed revision comparison in the current batch, cleared by
+  a transfer notification, pause, or termination. It does not establish that
+  network transfer has not begun.
+
+Counts and positions reset for each underlying PouchDB handler, including the
+transition from catch-up to continuous replication and a replacement attempt.
+Completion, failure, and cancellation retain final values with `phase: 'idle'`
+and `checking: false`. Replacing the provider clears its previous snapshot.
+
+Checkpoint events are accumulated internally and published periodically
+(currently about 200 ms). Transfer, pause, and terminal boundaries flush
+pending observations promptly. The interval is an implementation detail.
+The observer releases its timer and listeners on termination; late callbacks
+cannot publish into the next attempt. These observations do not modify the
+replication options, received documents, or native checkpoints.
 
 ## Rooted storage
 
@@ -119,11 +196,54 @@ See [the settings lifecycle guide](docs/settings-lifecycle.md) before initialisi
 
 The focused Setup URI entry offers an Ephemeral mode bound to the current fixed seven-day window and a Persistent mode compatible with existing readers. Both use the same URI structure. See [the Setup URI sharing guide](docs/setup-uri.md) for the availability boundary, import behaviour, and compatibility limits.
 
+## Database diagnostics
+
+The focused `/diagnostics` entry provides read-only Usage and integrity reports, with original names or temporary pseudonyms selected by the host for each run. Integrity inspection covers normal-file Metadata, current conflict branches, and content comparisons for suspect groups in the local database and, by default, CouchDB; the host can exclude the remote source for one run. See [Database diagnostics](docs/database-diagnostics.md) for coverage, progress, cancellation, pseudonym lookup, and privacy boundaries.
+
+Integrity Markdown places a compact state summary and review index before all findings, while retaining each observation and its follow-up references. This formatting does not change the projected JSON data or schema; see [the Markdown field guide](docs/database-diagnostics.md#compact-integrity-markdown-report) for the meaning and limits of its review index.
+
+```typescript
+import {
+    analyseDatabaseUsage,
+    createDiagnosticNameMapper,
+    createLocalDiagnosticSource,
+    formatUsageTSV,
+    parseDiagnosticPathToken,
+    projectUsageReport,
+} from '@vrtmrz/livesync-commonlib/diagnostics';
+
+const result = await analyseDatabaseUsage({ source: createLocalDiagnosticSource(localPouchDB) });
+const mapper = createDiagnosticNameMapper('pseudonym');
+const report = projectUsageReport(result, mapper);
+if (report.status === 'complete') {
+    const tsv = formatUsageTSV(report);
+    // Present the report through the host's own UI or output stream.
+}
+```
+
+Path pseudonyms include the report salt. A consumer can parse that token and supply its salt to a new mapper for a targeted follow-up against exact local Metadata paths:
+
+```typescript
+const pathToken = report.rows[0]?.path;
+const parsed = pathToken === undefined ? undefined : parseDiagnosticPathToken(pathToken);
+if (parsed) {
+    const followUpMapper = createDiagnosticNameMapper('pseudonym', parsed.salt);
+    const candidateToken = followUpMapper.path(storedVaultRelativePath);
+    // Compare this token with the path pseudonym on this device.
+}
+```
+
+The parser accepts only complete path tokens; it does not reverse them to recover a path. The salt is public, so a guessed path can be checked. Older ordinal pseudonyms have no corresponding lookup.
+
 ## Chunk ID calculation
 
 The `/hashing` entry exports `HashManager` and its `HashManagerCoreOptions` type. It uses the same implementation as database writes, including legacy algorithms and independent ID keys. Hosts supply their settings service and await `initialise()` before calling `computeHash(piece)`.
 
 `computeHash` returns the Chunk hash, including the `+` prefix when encryption is enabled; the database adds its `h:` namespace separately. Reuse a manager for repeated calculations with the same configuration, create a new manager when changing the legacy algorithm or passphrase, and call `clearCaches()` when retiring it. This releases retained key preparation; it does not erase existing settings or in-flight operations. The entry performs ID calculation and does not write Chunks to a database.
+
+## File content hashing
+
+`computeFileContentHash(content: Blob)` returns a `sha256:<lowercase hexadecimal>` digest of the exact bytes. It includes Blob reading and serialises concurrent hashes to limit whole-file buffer overlap. File-reflection provenance uses this helper to recognise unchanged content independently of retained revision history; it does not replace Chunk ID calculation.
 
 ## Remote connection profiles
 
@@ -135,6 +255,8 @@ See [the remote configuration profile guide](docs/remote-configurations.md) for 
 
 CouchDB stores the representations already in use as feature identifiers in its version document. Assess that document before synchronisation or direct file operations, and retain unknown identifiers for host diagnostics. See [the remote feature compatibility contract](docs/remote-feature-compatibility.md) for the wire format, update rules, and recovery boundaries.
 
+The maintained CLI and Obsidian hosts can opt into [Unicode NFC path identity](docs/unicode-path-identity.md) with CouchDB. Existing databases require an explicit Rebuild or Fetch migration before using it.
+
 ## Contract scope
 
 The package is currently an infrastructure and compatibility boundary. The context, rooted-storage, standard-I/O, and revision-tree safety contracts have focused cross-platform, instance-isolation, or real-PouchDB tests. Platform details which cannot be shared, such as file timestamp fidelity and browser permission handling, remain host concerns and are documented separately.
@@ -145,11 +267,11 @@ The accepted replacement direction is an asynchronously created file client with
 
 Package developers should read [the developer guide](docs/development.md). The focused contracts are described in [the storage guide](docs/platform-storage.md), [the standard-I/O guide](docs/platform-standard-io.md), [the settings lifecycle guide](docs/settings-lifecycle.md), [the remote configuration profile guide](docs/remote-configurations.md), [the remote feature compatibility contract](docs/remote-feature-compatibility.md), [the conflict-resolution guide](docs/conflict-resolution.md), and [the P2P transport lifecycle guide](docs/p2p-transport-lifecycle.md).
 
-## Proven in maintained hosts
+## Maintained-host examples and evidence
 
 The package boundary is exercised by Self-hosted LiveSync's Obsidian plug-in, CLI, WebApp, and WebPeer compositions. Their validation is not uniform: the Obsidian plug-in and CLI have the strongest device and long-running synchronisation evidence, while WebApp and WebPeer have focused adapter and runtime tests, browser smoke tests, a cross-application P2P scenario ending at the production CLI, and public Pages smoke validation.
 
-See [Proven in maintained hosts](docs/proven-in-use.md) for the actual composition points, downstream tests, and remaining limits. The examples deliberately separate focused public entries which a new consumer may copy from `compat/*` imports which exist to migrate the current application.
+See [Maintained-host examples and evidence](docs/proven-in-use.md) for composition points, downstream tests, and remaining limits. This optional page records examples and evidence; it does not define package support or create a release or adoption requirement. The examples deliberately separate focused public entries which a new consumer may copy from `compat/*` imports which exist to migrate the current application.
 
 ## Licence
 

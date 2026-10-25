@@ -155,6 +155,7 @@ describe("LiveSyncJournalReplicator replication compatibility state", () => {
                 API: {
                     getAppVersion: () => "app-version",
                     getPluginVersion: () => "plugin-version",
+                    getPlatform: () => "test-platform",
                 },
                 context: createServiceContext(),
                 database: { localNodeIdentity: { nodeId: "device-node" } },
@@ -231,6 +232,19 @@ describe("LiveSyncJournalReplicator replication compatibility state", () => {
             replicator.checkReplicationConnectivity(false, false, false, setting, client as never)
         ).resolves.toBe(false);
     });
+
+    it("rejects NFC path identity before checking Object Storage connectivity", async () => {
+        const { client, replicator, setting } = createConnectivityReplicator();
+        setting.pathNormalizationVersion = 1;
+
+        await expect(
+            replicator.checkReplicationConnectivity(false, false, false, setting, client as never)
+        ).resolves.toBe(false);
+
+        expect(client.isAvailable).not.toHaveBeenCalled();
+        expect(client.downloadJsonWithResult).not.toHaveBeenCalled();
+        expect(client.uploadJson).not.toHaveBeenCalled();
+    });
 });
 
 describe("LiveSyncJournalReplicator compatibility milestone", () => {
@@ -243,6 +257,7 @@ describe("LiveSyncJournalReplicator compatibility milestone", () => {
                 API: {
                     getAppVersion: vi.fn(() => "app-version"),
                     getPluginVersion: vi.fn(() => "plugin-version"),
+                    getPlatform: vi.fn(() => "test-platform"),
                 },
                 vault: {
                     getVaultName: vi.fn(() => "device-name"),
@@ -584,6 +599,16 @@ describe("LiveSyncJournalReplicator finite resource ownership", () => {
         await expect(replicator.tryConnectRemote(DEFAULT_SETTINGS, false)).resolves.toBe(expected);
 
         expect(dispose).toHaveBeenCalledOnce();
+    });
+
+    it("blocks an NFC Object Storage connection probe before creating a storage adapter", async () => {
+        const setting = { ...DEFAULT_SETTINGS, pathNormalizationVersion: 1 as const };
+        const listFiles = vi.spyOn(MinioStorageAdapter.prototype, "listFiles");
+        const replicator = new LiveSyncJournalReplicator({} as never);
+
+        await expect(replicator.tryConnectRemote(setting, false)).resolves.toBe(false);
+
+        expect(listFiles).not.toHaveBeenCalled();
     });
 
     it("does not construct a Journal client merely to close an unused Replicator", () => {

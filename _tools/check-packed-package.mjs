@@ -75,6 +75,8 @@ assert.ok(
     Object.hasOwn(generatedManifest.exports, "./hashing"),
     "Chunk hashing must be available through the focused hashing entry."
 );
+assert.ok(Object.hasOwn(generatedManifest.exports, "./diagnostics"), "Database diagnostics require a focused entry.");
+assert.ok(packed.files.some(({ path }) => path === "docs/database-diagnostics.md"));
 const declaredBinTargets = new Set(
     (typeof generatedManifest.bin === "string"
         ? [generatedManifest.bin]
@@ -130,6 +132,10 @@ assert.ok(
 assert.ok(
     packed.files.some(({ path }) => path === "docs/proven-in-use.md"),
     "The maintained-host evidence linked from the README must be included in the package."
+);
+assert.ok(
+    packed.files.some(({ path }) => path === "docs/unicode-path-identity.md"),
+    "The Unicode path identity guide linked from the README must be included in the package."
 );
 assert.ok(
     packed.files.some(({ path }) => path === "docs/storage-events-and-reflection.md"),
@@ -207,7 +213,7 @@ await writeConsumerFile(
                 skipLibCheck: true,
                 types: [],
             },
-            include: ["type-smoke.ts"],
+            include: ["type-smoke.ts", "handler-outcome-types.ts"],
         },
         null,
         2
@@ -226,12 +232,36 @@ import {
     type DirectFileManipulatorOptions,
     type DirectFileManipulatorRuntimeOptions,
 } from "${packageName}";
+import { declareUICommand, UICommandRegistry } from "${packageName}/ui-commands";
 import {
     createFileSystemAccessStorage,
     type CreateFileSystemAccessStorageOptions,
 } from "${packageName}/browser";
 import { splitPieces2Worker } from "${packageName}/compat/worker/bgWorker";
-import { HashManager, type HashManagerCoreOptions } from "${packageName}/hashing";
+import { HashManager, computeFileContentHash, type HashManagerCoreOptions } from "${packageName}/hashing";
+import {
+    analyseDatabaseUsage, type DatabaseUsageSource,
+    type DatabaseIntegrityOptions, type DatabaseIntegrityProgress, type DatabaseIntegrityLog,
+    type DiagnosticDatabaseSource, type DiagnosticDocumentReadResult,
+} from "${packageName}/diagnostics";
+const integrityCallbacks: Pick<DatabaseIntegrityOptions, "includeRemote" | "concurrency" | "onProgress" | "onLog"> = {
+    includeRemote: false,
+    concurrency: 4,
+    onProgress: (value: DatabaseIntegrityProgress) => { void value.total; },
+    onLog: (value: DatabaseIntegrityLog) => { void value.peakActiveReads; },
+};
+void integrityCallbacks;
+const readMany: NonNullable<DiagnosticDatabaseSource["getMany"]> = async (ids, options) => {
+    void options?.conflicts;
+    return ids.map((id): DiagnosticDocumentReadResult => ({ id, error: new Error("Unavailable") }));
+};
+void readMany;
+const diagnosticSource: DatabaseUsageSource = {
+    info: async () => ({ update_seq: 0 }),
+    enumerateIds: async function* () {},
+    get: async () => ({}),
+};
+void analyseDatabaseUsage({ source: diagnosticSource });
 import {
     NEW_VAULT_SETTINGS,
     SETTINGS_SCHEMA_DEFAULTS,
@@ -258,7 +288,13 @@ import {
     type CentralRemoteAdministrationRequest,
     type CentralRemoteAdministrationResult,
     type RemoteResourceCapabilities,
+    type JoinedDevicesResource,
+    type JoinedDevicesSnapshot,
+    type ForgetJoinedDeviceResult,
     type ReplicationOutcome,
+    type ReplicationStatics,
+    type CouchDBReplicationProgress,
+    type ReplicationCheckpointProgress,
 } from "${packageName}/replication";
 import type {
     P2PConnectionProbeAdmission,
@@ -305,10 +341,47 @@ const replicationConnection = {} as CouchDBReplicationConnection;
 type LegacyRemoteDatabase = Awaited<ReturnType<LiveSyncCouchDBReplicator["_ensureConnection"]>>;
 const readLegacyRemoteDatabase = (database: LegacyRemoteDatabase) => database.get("document-id");
 const completedOutcome: ReplicationOutcome = { status: "completed" };
+const checkpointProgress: ReplicationCheckpointProgress = {
+    checkedChanges: 30, completedBatches: 2, lastSeq: "opaque-position", checking: true,
+};
+const couchDBProgress: CouchDBReplicationProgress = { phase: "catch-up", pull: checkpointProgress };
+const replicationStatics: ReplicationStatics = {
+    sent: 0, arrived: 0, maxPullSeq: 0, maxPushSeq: 0,
+    lastSyncPullSeq: 0, lastSyncPushSeq: 0, syncStatus: "CONNECTED", couchDB: couchDBProgress,
+};
+void replicationStatics;
 const configurationIdentity: ReplicatorConfigurationIdentity = "profile-a";
 const activeReplicatorLifecycle = (replicator: ReplicatorInstance): Promise<void> =>
     Promise.resolve(replicator.closeReplication());
 const remoteResourceCapabilities: RemoteResourceCapabilities = NO_REMOTE_RESOURCE_CAPABILITIES;
+const joinedDevicesResourceKind: "joined-devices" = REMOTE_RESOURCE_KINDS.JOINED_DEVICES;
+const readJoinedDevices = (resource: JoinedDevicesResource): Promise<JoinedDevicesSnapshot> => resource.read();
+const forgetJoinedDevice = (resource: JoinedDevicesResource): Promise<ForgetJoinedDeviceResult> => resource.forget("old-device");
+async function checkUICommandTypes() {
+    const command = declareUICommand<{ deviceId: string }, { accepted: boolean }>("consumer:join-device");
+    const registry = new UICommandRegistry();
+    const unregister: () => void = registry.register(command, async (request) => ({ accepted: request.deviceId.length > 0 }));
+    const result = await registry.invoke(command, { deviceId: "device-1" });
+    if (result.status === "handled") {
+        const accepted: boolean = result.value.accepted;
+        void accepted;
+        // @ts-expect-error The published result retains the declared property type.
+        const invalidResult: string = result.value.accepted;
+        void invalidResult;
+    }
+    // @ts-expect-error A command requires its declared request shape.
+    registry.invoke(command, { deviceId: 1 });
+    // @ts-expect-error A handler cannot replace the declared request type.
+    registry.register(command, (request: { unrelated: string }) => ({ accepted: true }));
+    // @ts-expect-error A handler must return the declared result type.
+    registry.register(command, () => ({ accepted: "yes" }));
+    unregister();
+    registry.dispose();
+}
+void joinedDevicesResourceKind;
+void readJoinedDevices;
+void forgetJoinedDevice;
+void checkUICommandTypes;
 const centralRemoteAdministrationRequest: CentralRemoteAdministrationRequest = {
     action: CENTRAL_REMOTE_ADMINISTRATION_ACTIONS.LOCK,
 };
@@ -331,6 +404,8 @@ const createHashManager = (options: HashManagerCoreOptions): HashManager => new 
 const computeChunkHash = (manager: HashManager, value: string): Promise<string> => manager.computeHash(value);
 void createHashManager;
 void computeChunkHash;
+const fileHash: Promise<\`sha256:\${string}\`> = computeFileContentHash(new Blob(["abc"]));
+void fileHash;
 void context;
 void contextContract;
 void untranslated;
@@ -387,6 +462,47 @@ const contextApi = await import("${packageName}/context");
 const rootApi = await import("${packageName}");
 const settingsApi = await import("${packageName}/settings");
 const hashingApi = await import("${packageName}/hashing");
+const diagnosticsApi = await import("${packageName}/diagnostics");
+const usage = await diagnosticsApi.analyseDatabaseUsage({ source: {
+    info: async () => ({ update_seq: 0 }),
+    enumerateIds: async function* () {},
+    get: async () => { throw new Error("Unexpected read"); },
+} });
+assert.equal(usage.status, "complete");
+assert.equal(usage.rows.length, 1);
+assert.equal(usage.rows[0].id, "__orphan");
+const names = diagnosticsApi.createDiagnosticNameMapper("pseudonym");
+const pathToken = names.path("private.md");
+const parsedPathToken = diagnosticsApi.parseDiagnosticPathToken(pathToken);
+assert.ok(parsedPathToken);
+assert.equal(parsedPathToken.salt, names.salt);
+assert.equal(names.path("private.md"), pathToken);
+assert.equal(diagnosticsApi.createDiagnosticNameMapper("pseudonym", parsedPathToken.salt).path("private.md"), pathToken);
+assert.match(names.revision("7-private-revision"), /^7-psu[0-9a-f]{32}$/);
+const integrityProgress = [];
+const integrityLogs = [];
+const localIntegrity = await diagnosticsApi.analyseDatabaseIntegrity({
+    includeRemote: false,
+    remote: async () => { throw new Error("Excluded remote opened"); },
+    local: {
+        info: async () => ({ update_seq: 0, doc_count: 0 }),
+        enumerateIds: async function* () {},
+        get: async () => { throw new Error("Unexpected read"); },
+    },
+    path: { getPath: () => "", path2id: async () => "" },
+    settings: { encrypt: false, usePathObfuscation: false, handleFilenameCaseSensitive: true,
+        idDerivationVersion: 0, pathNormalizationVersion: 0 },
+    readStorage: async () => ({ status: "not-checked" }),
+    isConfigurationCurrent: () => true,
+    onProgress: (value) => integrityProgress.push(value),
+    onLog: (value) => integrityLogs.push(value),
+});
+assert.equal(integrityProgress[0].total, 0);
+assert.equal(localIntegrity.status, "complete");
+assert.equal(localIntegrity.scope.remote, "excluded");
+assert.equal(localIntegrity.coverage.remote.status, "not-checked");
+assert.equal(integrityProgress[0].source, "local");
+assert.ok(integrityLogs.some((value) => value.event === "completed" && value.concurrency === 4));
 const setupUriApi = await import("${packageName}/setup-uri");
 const remoteConfigurationsApi = await import("${packageName}/remote-configurations");
 const p2pApi = await import("${packageName}/p2p");
@@ -403,7 +519,9 @@ assert.equal(
     "increase to 800MB"
 );
 assert.equal(typeof rootApi.DirectFileManipulator, "function");
-assert.deepEqual(Object.keys(hashingApi), ["HashManager"]);
+assert.deepEqual(Object.keys(hashingApi).sort(), ["HashManager", "computeFileContentHash"]);
+assert.equal(await hashingApi.computeFileContentHash(new Blob(["abc"])),
+    "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
 const hashSettings = {
     ...settingsApi.DEFAULT_SETTINGS,
     encrypt: true,
@@ -437,6 +555,15 @@ assert.equal(p2pApi.ACTIVE_P2P_RELAY_BINDING_CONFLICT, "active-p2p-relay-binding
 assert.equal(replicationApi.NO_INTERACTION.kind, "forbidden");
 assert.equal(replicationApi.CENTRAL_COMPATIBILITY_REJECTION_REASONS.NODE_LOCKED, "node-locked");
 assert.equal(replicationApi.REMOTE_RESOURCE_KINDS.SECURITY_SEED, "security-seed");
+assert.equal(replicationApi.REMOTE_RESOURCE_KINDS.JOINED_DEVICES, "joined-devices");
+const { declareUICommand, UICommandRegistry } = await import("${packageName}/ui-commands");
+const uiCommand = declareUICommand("package-test");
+const uiCommands = new UICommandRegistry();
+assert.deepEqual(await uiCommands.invoke(uiCommand, 2), { status: "unavailable" });
+const unregisterUICommand = uiCommands.register(uiCommand, (value) => value + 1);
+assert.deepEqual(await uiCommands.invoke(uiCommand, 2), { status: "handled", value: 3 });
+unregisterUICommand();
+uiCommands.dispose();
 assert.equal(replicationApi.CENTRAL_REMOTE_ADMINISTRATION_ACTIONS.LOCK, "lock");
 assert.equal(replicationApi.CENTRAL_REMOTE_ADMINISTRATION_FAILURE_REASONS.POSTCONDITION_MISMATCH, "postcondition-mismatch");
 assert.equal(typeof replicationApi.isReplicationCompleted, "function");
@@ -509,13 +636,22 @@ void storage;
 );
 await writeConsumerFile(
     "browser-hashing.ts",
-    `export { HashManager } from "${packageName}/hashing";
+    `export { HashManager, computeFileContentHash } from "${packageName}/hashing";
 `
+);
+await writeConsumerFile(
+    "browser-diagnostics.ts",
+    `export { analyseDatabaseUsage, analyseDatabaseIntegrity, createCouchDBDiagnosticSource, projectIntegrityReport } from "${packageName}/diagnostics";\n`
 );
 await writeConsumerFile(
     "browser-worker.ts",
     `export { initialiseWorkerModule, splitPieces2Worker } from "${packageName}/compat/worker/bgWorker";
 `
+);
+
+await writeConsumerFile(
+    "handler-outcome-types.ts",
+    await readFile(resolve(root, "_tools/fixtures/handler-outcome-types.ts"), "utf8")
 );
 
 run(
@@ -635,6 +771,23 @@ const hashingBundle = await build({
     write: false,
 });
 
+const diagnosticsBundle = await build({
+    absWorkingDir: consumerDirectory,
+    bundle: true,
+    conditions: ["browser"],
+    entryPoints: [resolve(consumerDirectory, "browser-diagnostics.ts")],
+    external: ["crypto"],
+    format: "esm",
+    logLevel: "silent",
+    metafile: true,
+    platform: "browser",
+    write: false,
+});
+assert.ok(
+    Object.keys(diagnosticsBundle.metafile.inputs).every((path) => !path.includes("/dist/platform/node/")),
+    "Diagnostics must not require Node-only host APIs."
+);
+
 const workerBundle = await build({
     absWorkingDir: consumerDirectory,
     bundle: true,
@@ -702,6 +855,7 @@ assert.deepEqual(
         ".",
         "./browser",
         "./context",
+        "./diagnostics",
         "./hashing",
         "./node",
         "./p2p",
@@ -711,10 +865,11 @@ assert.deepEqual(
         "./rpc",
         "./settings",
         "./setup-uri",
+        "./ui-commands",
     ],
     "The focused package surface must remain explicit."
 );
-assert.equal(Object.keys(manifest.exports).length, inventory.compatibility.length + 12);
+assert.equal(Object.keys(manifest.exports).length, inventory.compatibility.length + 14);
 
 console.log(
     JSON.stringify(

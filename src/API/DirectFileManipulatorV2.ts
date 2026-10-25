@@ -1,3 +1,4 @@
+import { MemoryValueStore } from "@vrtmrz/value-store";
 /**
  * The API for manipulating files stored in the CouchDB by Self-hosted LiveSync or its families.
  */
@@ -19,12 +20,18 @@ import {
     DEFAULT_SYNC_PARAMETERS,
     ProtocolVersions,
     DOCID_SYNC_PARAMETERS,
+    VERSIONING_DOCID,
     type E2EEAlgorithm,
     E2EEAlgorithms,
     VER,
 } from "@lib/common/types.ts";
 import { checkRemoteVersion } from "@lib/pouchdb/negotiation.ts";
-import { requiredRemoteFeatures, usesEncryptedInternalMetadata } from "@lib/pouchdb/remoteFeatureCompatibility.ts";
+import {
+    assessRemoteFeatureDocument,
+    NFC_PATH_IDENTITY_FEATURE,
+    requiredRemoteFeatures,
+    usesEncryptedInternalMetadata,
+} from "@lib/pouchdb/remoteFeatureCompatibility.ts";
 import { assessRemoteDocumentIds } from "@lib/pouchdb/remoteIdCompatibility.ts";
 
 import { PouchDB } from "@lib/pouchdb/pouchdb-http.ts";
@@ -74,6 +81,8 @@ export type DirectFileManipulatorOptions = {
     maxChunksInEden?: number;
     maxTotalLengthInEden?: number;
     maxAgeInEden?: number;
+    /** Enables synchronisation of dot-prefixed internal files. */
+    syncInternalFiles?: boolean;
     /**
      * @deprecated use chunkSplitterVersion instead.
      */
@@ -147,6 +156,15 @@ export class DirectFileManipulator implements LiveSyncLocalDBEnv {
             if (idCompatibility === "mismatched") {
                 throw new Error("Direct database document IDs do not match the configured ID key.");
             }
+            try {
+                const versionInfo = await this.liveSyncLocalDB.localDatabase.get(VERSIONING_DOCID);
+                const assessment = assessRemoteFeatureDocument(versionInfo);
+                if (assessment.status === "supported" && assessment.usedFeatures.includes(NFC_PATH_IDENTITY_FEATURE)) {
+                    throw new Error("Direct database version or features are not compatible.");
+                }
+            } catch (error) {
+                if (!isErrorOfMissingDoc(error)) throw error;
+            }
             const requiredFeatures = requiredRemoteFeatures(this.settings);
             if (
                 !(await checkRemoteVersion(
@@ -196,6 +214,7 @@ export class DirectFileManipulator implements LiveSyncLocalDBEnv {
         const getSettings = () => this.settings;
         const context = new ServiceContext();
         this.services = new HeadlessServiceHub(context, {
+            deviceValues: new MemoryValueStore(),
             pouchDB: PouchDB as unknown as PouchDB.Static,
             database: this.getBoundDatabaseService(() => this.options, this.runtimeOptions),
             getPathObfuscationPassphrase: () => this.options.obfuscatePassphrase ?? false,
@@ -344,6 +363,7 @@ export class DirectFileManipulator implements LiveSyncLocalDBEnv {
                     this.options.handleFilenameCaseSensitive ?? DEFAULT_SETTINGS.handleFilenameCaseSensitive,
                 usePathObfuscation: !!this.options.obfuscatePassphrase,
                 encryptInternalMetadata: this.options.encryptInternalMetadata ?? false,
+                syncInternalFiles: this.options.syncInternalFiles ?? DEFAULT_SETTINGS.syncInternalFiles,
                 E2EEAlgorithm: this.options.E2EEAlgorithm ?? E2EEAlgorithms.V2,
             },
         };

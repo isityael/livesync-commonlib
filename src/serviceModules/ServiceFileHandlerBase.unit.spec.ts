@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import { BASE_IS_NEW, EVEN, TARGET_IS_NEW } from "@lib/common/models/shared.const.symbols";
 import type {
@@ -8,10 +9,12 @@ import type {
     UXFileInfo,
     UXFileInfoStub,
 } from "@lib/common/types";
+import * as contentUtils from "@lib/common/utils";
 import { createBinaryBlob, createTextBlob } from "@lib/common/utils";
 import { encodeBinary } from "@lib/string_and_binary/convert";
 import { ServiceFileHandlerBase, type ServiceFileHandlerDependencies } from "./ServiceFileHandlerBase";
 import { createLiveSyncEventHub } from "@lib/hub/hub";
+import type { FileReflectionProvenanceRecord } from "@lib/interfaces/FileReflectionProvenance";
 
 class TestFileHandler extends ServiceFileHandlerBase {}
 
@@ -59,7 +62,8 @@ function createHandler(
     remoteBody: string,
     localContentIsKnown: boolean,
     freshness: typeof BASE_IS_NEW | typeof TARGET_IS_NEW | typeof EVEN = TARGET_IS_NEW,
-    trackProvenance: boolean = false
+    trackProvenance: boolean = false,
+    pathNormalizationVersion: 0 | 1 = 0
 ) {
     const path = "note.md";
     const remoteMeta = createMeta(path, remoteBody);
@@ -112,6 +116,9 @@ function createHandler(
         delete: vi.fn().mockResolvedValue(undefined),
         move: vi.fn().mockResolvedValue(undefined),
     };
+    const setting = {
+        currentSettings: vi.fn().mockReturnValue({ writeDocumentsIfConflicted: false, pathNormalizationVersion }),
+    };
     const deps = {
         events: createLiveSyncEventHub(),
         API: { addLog: vi.fn() },
@@ -121,7 +128,7 @@ function createHandler(
         replication: { processSynchroniseResult: { addHandler: vi.fn() } },
         conflict,
         path: pathService,
-        setting: { currentSettings: vi.fn().mockReturnValue({ writeDocumentsIfConflicted: false }) },
+        setting,
         vault: {},
         fileReflectionProvenance: trackProvenance ? provenance : undefined,
     } as unknown as ServiceFileHandlerDependencies;
@@ -129,12 +136,14 @@ function createHandler(
     return {
         handler: new TestFileHandler(deps),
         remoteMeta,
+        storageFile,
         storageStub: storageStub as UXFileInfoStub,
         databaseFileAccess,
         storageAccess,
         conflict,
         pathService,
         provenance,
+        setting,
     };
 }
 
@@ -143,17 +152,73 @@ describe("ServiceFileHandlerBase.tryRecordUntrackedFileRevision", () => {
         return createHandler(localBody, databaseBody, false, EVEN, true);
     }
 
+    it.each([0, 1] as const)("records the configured Unicode identity for physical paths in mode %s", async (version) => {
+        const { handler, storageAccess, databaseFileAccess, provenance } = createHandler(
+            "same content", "same content", false, EVEN, true, version
+        );
+        const physicalPath = "Cafe\u0301.md";
+        const file = createStorageFile(physicalPath, "same content");
+        const meta = createMeta(physicalPath, "same content");
+        storageAccess.getStub.mockResolvedValue(file);
+        storageAccess.readStubContent.mockResolvedValue(file);
+        databaseFileAccess.fetchEntryMeta.mockResolvedValue(meta);
+        databaseFileAccess.fetchEntry.mockResolvedValue({ ...meta, data: "same content" });
+
+        await expect(handler.tryRecordUntrackedFileRevision(file, meta._rev!)).resolves.toBe(true);
+
+        expect(provenance.set).toHaveBeenCalledWith(version === 1 ? physicalPath.normalize("NFC") : physicalPath, {
+            revision: meta._rev, observedStorageMtime: file.stat.mtime,
+            contentHash: "sha256:a636bd7cd42060a4d07fa1bfbcc010eb7794c2ba721e1e3e4c20335a15b66eaf",
+            contentSize: 12,
+        });
+    });
+
     it("records matching current content without writing a file or database revision", async () => {
         const { handler, storageStub, databaseFileAccess, storageAccess, provenance } = fixture();
 
         await expect(handler.tryRecordUntrackedFileRevision(storageStub, "2-remote")).resolves.toBe(true);
 
-        expect(provenance.set).toHaveBeenCalledExactlyOnceWith("note.md", {
+        expect(provenance.set).toHaveBeenCalledExactlyOnceWith("note.md", expect.objectContaining({
             revision: "2-remote", observedStorageMtime: storageStub.stat.mtime,
-        });
+        }));
         expect(databaseFileAccess.storeWithBaseRevision).not.toHaveBeenCalled();
         expect(databaseFileAccess.storeIndependentRevision).not.toHaveBeenCalled();
         expect(storageAccess.writeFileAuto).not.toHaveBeenCalled();
+    });
+
+    it("upgrades a legacy record only after verifying its exact current revision", async () => {
+        const { handler, storageStub, provenance } = fixture();
+        provenance.get.mockResolvedValue({ revision: "2-remote", observedStorageMtime: 1 });
+        await expect(handler.tryRecordUntrackedFileRevision(storageStub, "2-remote")).resolves.toBe(true);
+        expect(provenance.set).toHaveBeenCalledWith("note.md", {
+            revision: "2-remote", observedStorageMtime: storageStub.stat.mtime,
+            contentHash: "sha256:a636bd7cd42060a4d07fa1bfbcc010eb7794c2ba721e1e3e4c20335a15b66eaf",
+            contentSize: 12,
+        });
+    });
+
+    it("does not attach a legacy hash to bytes changed during hashing", async () => {
+        const { handler, storageStub, storageFile, storageAccess, provenance } = fixture();
+        provenance.get.mockResolvedValue({ revision: "2-remote" });
+        const read = storageFile.body.arrayBuffer.bind(storageFile.body);
+        vi.spyOn(storageFile.body, "arrayBuffer").mockImplementation(async () => {
+            storageAccess.getStub.mockResolvedValue(createStorageFile("note.md", "edited later"));
+            return await read();
+        });
+        await expect(handler.tryRecordUntrackedFileRevision(storageStub, "2-remote")).resolves.toBe(false);
+        expect(provenance.set).not.toHaveBeenCalled();
+    });
+
+    it("does not replace evidence changed on the same revision during hashing", async () => {
+        const { handler, storageStub, storageFile, provenance } = fixture();
+        provenance.get.mockResolvedValue({ revision: "2-remote" });
+        const read = storageFile.body.arrayBuffer.bind(storageFile.body);
+        vi.spyOn(storageFile.body, "arrayBuffer").mockImplementation(async () => {
+            provenance.get.mockResolvedValue({ revision: "2-remote", contentHash: "sha256:" + "a".repeat(64), contentSize: 12 });
+            return await read();
+        });
+        await expect(handler.tryRecordUntrackedFileRevision(storageStub, "2-remote")).resolves.toBe(false);
+        expect(provenance.set).not.toHaveBeenCalled();
     });
 
     it("keeps an existing displayed revision even when current bytes match another revision", async () => {
@@ -262,7 +327,7 @@ function createRenameHandler(caseInsensitive: boolean, oldEntry: MetaEntry | fal
         events: createLiveSyncEventHub(),
         API: { addLog: vi.fn() },
         databaseFileAccess,
-        storageAccess: { getStub: vi.fn().mockResolvedValue(null) },
+        storageAccess: { getStub: vi.fn().mockResolvedValue(null), normalisePath: (path: string) => path },
         fileProcessing: {
             processFileEvent: {
                 addHandler: vi.fn((handler: (item: FileEventItem) => Promise<boolean>) => {
@@ -274,11 +339,11 @@ function createRenameHandler(caseInsensitive: boolean, oldEntry: MetaEntry | fal
         conflict: {},
         path: pathService,
         setting: { currentSettings: vi.fn().mockReturnValue({}) },
-        vault: { isTargetFile: vi.fn().mockResolvedValue(true) },
+        vault: { isTargetFile: vi.fn().mockResolvedValue(true), isFileSizeTooLarge: () => false },
     } as unknown as ServiceFileHandlerDependencies;
     const handler = new TestFileHandler(deps);
     if (!processFileEvent) throw new Error("File event handler was not registered");
-    return { handler, processFileEvent, databaseFileAccess, pathService };
+    return { handler, processFileEvent, databaseFileAccess, pathService, storageAccess: deps.storageAccess };
 }
 
 function createRestoredEvent(type: FileEventItem["type"], file: UXFileInfoStub, oldPath?: string): FileEventItem {
@@ -294,6 +359,7 @@ function createRestoredEventHandler(
     options: {
         currentItems?: Record<string, UXFileInfoStub | { path: FilePath; isFolder: true } | null>;
         caseInsensitiveIds?: boolean;
+        databaseEntries?: Record<string, MetaEntry | false>;
         isTargetFile?: (path: string) => boolean;
         isTargetFileWithoutDuplication?: (path: string) => boolean;
         isFileSizeTooLarge?: (size: number) => boolean;
@@ -307,6 +373,7 @@ function createRestoredEventHandler(
     };
     const pathService = {
         path2id: vi.fn(async (path: string) => (options.caseInsensitiveIds ? path.toLowerCase() : path)),
+        getPath: (entry: MetaEntry) => entry.path,
     };
     const vault = {
         isTargetFile: vi.fn(async (path: string, check?: { skipCaseCollisionCheck?: boolean }) =>
@@ -319,7 +386,11 @@ function createRestoredEventHandler(
     const dependencies = {
         events: createLiveSyncEventHub(),
         API: { addLog: vi.fn() },
-        databaseFileAccess: {},
+        databaseFileAccess: {
+            fetchEntryMeta: vi.fn(async (path: string) =>
+                options.databaseEntries?.[path] ?? createMeta(path, "stored content")
+            ),
+        },
         storageAccess,
         fileProcessing: {
             processFileEvent: {
@@ -548,7 +619,7 @@ describe("ServiceFileHandlerBase.renameFileInDB", () => {
     });
 
     it("serialises case variants by their canonical document ID", async () => {
-        const { handler, processFileEvent } = createRenameHandler(true);
+        const { handler, processFileEvent, storageAccess } = createRenameHandler(true);
         let notifyDeleteStarted: (() => void) | undefined;
         let releaseDelete: (() => void) | undefined;
         const deleteStarted = new Promise<void>((resolve) => {
@@ -572,6 +643,8 @@ describe("ServiceFileHandlerBase.renameFileInDB", () => {
 
         const deletePromise = processFileEvent({ type: "DELETE", args: { file: oldFile }, key: "delete" });
         await deleteStarted;
+        // The recreated file exists while its event waits for the old deletion.
+        vi.mocked(storageAccess.getStub).mockResolvedValue(newFile);
         const createPromise = processFileEvent({ type: "CREATE", args: { file: newFile }, key: "create" });
         await new Promise((resolve) => setTimeout(resolve, 10));
 
@@ -630,7 +703,8 @@ describe("ServiceFileHandlerBase current storage deletions", () => {
         const { processFileEvent, storageAccess, deleteFileFromDB } = createRestoredEventHandler();
         storageAccess.getStub.mockRejectedValue(new Error("Storage inspection failed"));
 
-        await processFileEvent({ type: "DELETE", args: { file: saved }, key: "unverified-delete" });
+        await expect(processFileEvent({ type: "DELETE", args: { file: saved }, key: "unverified-delete" }))
+            .resolves.toBe(false);
 
         expect(deleteFileFromDB).not.toHaveBeenCalled();
     });
@@ -776,7 +850,7 @@ describe("ServiceFileHandlerBase restored storage events", () => {
         const { processFileEvent, storageAccess, deleteFileFromDB } = createRestoredEventHandler();
         storageAccess.getStub.mockRejectedValueOnce(new Error("storage unavailable"));
 
-        await expect(processFileEvent(createRestoredEvent("DELETE", saved))).resolves.toBe(true);
+        await expect(processFileEvent(createRestoredEvent("DELETE", saved))).resolves.toBe(false);
 
         expect(deleteFileFromDB).not.toHaveBeenCalled();
     });
@@ -857,6 +931,7 @@ describe("ServiceFileHandlerBase restored storage events", () => {
         const { processFileEvent, renameFileInDB } = createRestoredEventHandler({
             currentItems: { "note.md": current, "Note.md": current },
             caseInsensitiveIds: true,
+            databaseEntries: { "note.md": createMeta("Note.md", "saved") },
         });
 
         await expect(processFileEvent(createRestoredEvent("RENAME", saved, "Note.md"))).resolves.toBe(true);
@@ -887,7 +962,7 @@ describe("ServiceFileHandlerBase restored storage events", () => {
             return current;
         });
 
-        await expect(processFileEvent(createRestoredEvent("RENAME", saved, "old.md"))).resolves.toBe(true);
+        await expect(processFileEvent(createRestoredEvent("RENAME", saved, "old.md"))).resolves.toBe(false);
 
         expect(storeFileToDB).toHaveBeenCalledWith(current);
         expect(deleteFileFromDB).not.toHaveBeenCalled();
@@ -899,7 +974,7 @@ describe("ServiceFileHandlerBase restored storage events", () => {
         const { processFileEvent, storageAccess, deleteFileFromDB } = createRestoredEventHandler();
         storageAccess.getStub.mockRejectedValueOnce(new Error("target unavailable"));
 
-        await expect(processFileEvent(createRestoredEvent("RENAME", saved, "old.md"))).resolves.toBe(true);
+        await expect(processFileEvent(createRestoredEvent("RENAME", saved, "old.md"))).resolves.toBe(false);
 
         expect(deleteFileFromDB).not.toHaveBeenCalled();
     });
@@ -917,6 +992,66 @@ describe("ServiceFileHandlerBase restored storage events", () => {
 });
 
 describe("ServiceFileHandlerBase.dbToStorage", () => {
+    it.each([
+        { name: "complete surrogate pairs", chunks: ["prefix ", "🙂", " suffix"], skipSizeCheck: false },
+        { name: "split surrogate pairs", chunks: ["prefix \uD83D", "\uDE42 suffix"], skipSizeCheck: false },
+        {
+            name: "split surrogate pairs with size checking disabled",
+            chunks: ["prefix \uD83D", "\uDE42 suffix"],
+            skipSizeCheck: true,
+        },
+    ])("reflects text and records matching byte evidence for $name", async ({ chunks, skipSizeCheck }) => {
+        const content = "prefix 🙂 suffix";
+        const {
+            handler,
+            remoteMeta,
+            storageStub,
+            storageFile,
+            databaseFileAccess,
+            storageAccess,
+            provenance,
+            setting,
+        } = createHandler("old", content, false, TARGET_IS_NEW, true);
+        setting.currentSettings.mockReturnValue({
+            ...setting.currentSettings(),
+            processSizeMismatchedFiles: skipSizeCheck,
+        });
+        databaseFileAccess.fetchEntryFromMeta.mockResolvedValue({ ...remoteMeta, data: chunks });
+
+        await expect(handler.dbToStorageWithSpecificRev(storageStub, remoteMeta._rev, true)).resolves.toBe(true);
+
+        expect(storageAccess.writeFileAuto).toHaveBeenCalledExactlyOnceWith("note.md", content, {
+            ctime: remoteMeta.ctime,
+            mtime: remoteMeta.mtime,
+        });
+        expect(provenance.set).toHaveBeenCalledExactlyOnceWith("note.md", {
+            revision: remoteMeta._rev,
+            observedStorageMtime: storageFile.stat.mtime,
+            contentSize: Buffer.byteLength(content, "utf8"),
+            contentHash: `sha256:${createHash("sha256").update(content, "utf8").digest("hex")}`,
+        });
+    });
+
+    it("reuses decoded binary content for validation and reflection evidence", async () => {
+        const fixture = createHandler("old", "unused", false);
+        const bytes = new Uint8Array([0, 255, 31, 128]);
+        const path = "attachment.bin";
+        const meta = { ...createMeta(path, ""), type: "newnote", datatype: "newnote", size: bytes.byteLength };
+        fixture.storageStub.path = path as FilePath;
+        fixture.storageStub.name = path;
+        fixture.databaseFileAccess.fetchEntryMeta.mockResolvedValue(meta);
+        fixture.databaseFileAccess.fetchEntryFromMeta.mockResolvedValue({ ...meta, data: await encodeBinary(bytes) });
+        const reconstruct = vi.spyOn(contentUtils, "readAsBlob");
+        try {
+            await expect(fixture.handler.dbToStorageWithSpecificRev(fixture.storageStub, meta._rev, true)).resolves.toBe(true);
+            expect(reconstruct).not.toHaveBeenCalled();
+            const written = fixture.storageAccess.writeFileAuto.mock.calls[0]?.[1] as ArrayBuffer;
+            expect(new Uint8Array(written)).toEqual(bytes);
+        } finally {
+            reconstruct.mockRestore();
+        }
+    });
+
     it.each(["touched", "stat"] as const)(
         "does not replace newer provenance set while an earlier reflection awaits %s",
         async (pauseAt) => {
@@ -1148,60 +1283,185 @@ describe("ServiceFileHandlerBase.dbToStorage", () => {
         expect(deleteVaultItem).not.toHaveBeenCalled();
     });
 
-    it("applies a canonical filename case change before comparing content", async () => {
+    it.each([0, 1] as const)(
+        "applies a canonical filename case change before comparing content with path normalisation version %s",
+        async (pathNormalizationVersion) => {
+            const { handler, storageStub, databaseFileAccess, storageAccess, pathService } = createHandler(
+                "same body",
+                "same body",
+                false,
+                EVEN,
+                false,
+                pathNormalizationVersion
+            );
+            const remoteMeta = createMeta("calculus.md", "same body");
+            const existingFile = {
+                ...storageStub,
+                name: "Calculus.md",
+                path: "Calculus.md" as FilePath,
+            };
+            const renamedFile = {
+                ...existingFile,
+                name: "calculus.md",
+                path: "calculus.md" as FilePath,
+            };
+            databaseFileAccess.fetchEntryMeta.mockResolvedValue(remoteMeta);
+            databaseFileAccess.fetchEntryFromMeta.mockResolvedValue({ ...remoteMeta, data: "same body" });
+            storageAccess.getStub.mockResolvedValue(existingFile);
+            storageAccess.renameFile.mockResolvedValue(renamedFile);
+            storageAccess.readStubContent.mockResolvedValue(createStorageFile("calculus.md", "same body"));
+
+            await expect(handler.dbToStorage(remoteMeta, existingFile)).resolves.toBe(true);
+
+            expect(pathService.path2id).toHaveBeenCalledWith("Calculus.md");
+            expect(pathService.path2id).toHaveBeenCalledWith("calculus.md");
+            expect(storageAccess.renameFile).toHaveBeenCalledWith(existingFile, "calculus.md");
+            expect(storageAccess.writeFileAuto).not.toHaveBeenCalled();
+        }
+    );
+
+    it("applies a filename case change when the parent directory differs only by Unicode normalisation", async () => {
         const { handler, storageStub, databaseFileAccess, storageAccess, pathService } = createHandler(
             "same body",
             "same body",
             false,
-            EVEN
+            EVEN,
+            false,
+            1
         );
-        const remoteMeta = createMeta("calculus.md", "same body");
+        const nfdParent = "Cafe\u0301";
+        const nfcParent = "Caf\u00e9";
+        const remoteMeta = createMeta(`${nfcParent}/note.md`, "same body");
         const existingFile = {
             ...storageStub,
-            name: "Calculus.md",
-            path: "Calculus.md" as FilePath,
+            name: "Note.md",
+            path: `${nfdParent}/Note.md` as FilePath,
         };
         const renamedFile = {
             ...existingFile,
-            name: "calculus.md",
-            path: "calculus.md" as FilePath,
+            name: "note.md",
+            path: `${nfdParent}/note.md` as FilePath,
         };
         databaseFileAccess.fetchEntryMeta.mockResolvedValue(remoteMeta);
-        databaseFileAccess.fetchEntryFromMeta.mockResolvedValue({ ...remoteMeta, data: "same body" });
         storageAccess.getStub.mockResolvedValue(existingFile);
         storageAccess.renameFile.mockResolvedValue(renamedFile);
-        storageAccess.readStubContent.mockResolvedValue(createStorageFile("calculus.md", "same body"));
+        storageAccess.readStubContent.mockResolvedValue(createStorageFile(`${nfdParent}/note.md`, "same body"));
+        pathService.path2id.mockImplementation(async (path: string) => path.normalize("NFC").toLowerCase());
 
         await expect(handler.dbToStorage(remoteMeta, existingFile)).resolves.toBe(true);
 
-        expect(pathService.path2id).toHaveBeenCalledWith("Calculus.md");
-        expect(pathService.path2id).toHaveBeenCalledWith("calculus.md");
-        expect(storageAccess.renameFile).toHaveBeenCalledWith(existingFile, "calculus.md");
+        expect(pathService.path2id).toHaveBeenCalledWith(`${nfdParent}/Note.md`);
+        expect(pathService.path2id).toHaveBeenCalledWith(`${nfcParent}/note.md`);
+        expect(storageAccess.renameFile).toHaveBeenCalledWith(existingFile, `${nfcParent}/note.md`);
         expect(storageAccess.writeFileAuto).not.toHaveBeenCalled();
     });
 
-    it("preserves a file when the canonical path change also changes parent directory case", async () => {
-        const { handler, storageStub, databaseFileAccess, storageAccess } = createHandler(
-            "same body",
-            "same body",
-            false,
-            EVEN
+    it.each([false, true].flatMap(deleted => [false, true].map(basePruned => ({ deleted, basePruned }))))(
+        "reflects an NFC update or deletion against NFD storage with shared provenance (deleted: $deleted, base pruned: $basePruned)",
+        async ({ deleted, basePruned }) => {
+        const { handler, databaseFileAccess, storageAccess, pathService, provenance } = createHandler(
+            "old body", "remote body", false, TARGET_IS_NEW, true, 1
         );
-        const remoteMeta = createMeta("renamed/calculus.md", "same body");
-        const existingFile = {
-            ...storageStub,
-            name: "Calculus.md",
-            path: "Renamed/Calculus.md" as FilePath,
-        };
-        databaseFileAccess.fetchEntryMeta.mockResolvedValue(remoteMeta);
-        storageAccess.getStub.mockResolvedValue(existingFile);
+        const logicalPath = "Café.md";
+        const physicalPath = logicalPath.normalize("NFD");
+        const file = createStorageFile(physicalPath, "old body");
+        const meta = { ...createMeta(logicalPath, "remote body"), deleted };
+        const base = { ...createMeta(logicalPath, "old body", "1-base"), data: "old body" };
+        const records = new Map<string, FileReflectionProvenanceRecord>([[logicalPath, {
+            revision: base._rev!,
+            ...(basePruned ? {
+                contentHash: `sha256:${createHash("sha256").update("old body").digest("hex")}`,
+                contentSize: byteLength("old body"),
+            } : {}),
+        }]]);
+        provenance.get.mockImplementation(async (path: string) => records.get(path));
+        provenance.set.mockImplementation(async (path: string, record: FileReflectionProvenanceRecord) => { records.set(path, record); });
+        provenance.delete.mockImplementation(async (path: string) => { records.delete(path); });
+        storageAccess.getStub.mockResolvedValue(file);
+        storageAccess.readStubContent.mockResolvedValue(file);
+        const deleteVaultItem = vi.fn().mockResolvedValue(true);
+        Object.assign(storageAccess, { deleteVaultItem });
+        databaseFileAccess.fetchEntryMeta.mockImplementation(async (_path: string, rev?: string) =>
+            basePruned && rev === base._rev ? false : meta
+        );
+        databaseFileAccess.fetchEntryFromMeta.mockResolvedValue({ ...meta, data: "remote body" });
+        databaseFileAccess.fetchEntry.mockResolvedValue(basePruned ? false : base);
+        pathService.path2id.mockImplementation(async (path: string) => path.normalize("NFC"));
 
-        await expect(handler.dbToStorage(remoteMeta, existingFile)).resolves.toBe(false);
+        await expect(handler.dbToStorage(meta, file, false)).resolves.toBe(true);
 
         expect(storageAccess.renameFile).not.toHaveBeenCalled();
-        expect(databaseFileAccess.fetchEntryFromMeta).not.toHaveBeenCalled();
-        expect(storageAccess.writeFileAuto).not.toHaveBeenCalled();
+        expect(databaseFileAccess.storeIndependentRevision).not.toHaveBeenCalled();
+        expect(databaseFileAccess.storeWithBaseRevision).not.toHaveBeenCalled();
+        if (deleted) {
+            expect(deleteVaultItem).toHaveBeenCalledWith(logicalPath);
+            expect(records.size).toBe(0);
+        } else {
+            expect(storageAccess.writeFileAuto).toHaveBeenCalledWith(logicalPath, "remote body", {
+                ctime: meta.ctime, mtime: meta.mtime,
+            });
+            expect(records.get(logicalPath)?.revision).toBe(meta._rev);
+        }
     });
+
+    it("preserves an NFC-equivalent physical path while applying an incoming update", async () => {
+        const { handler, databaseFileAccess, storageAccess, pathService, provenance } = createHandler(
+            "old body",
+            "remote body",
+            false,
+            TARGET_IS_NEW,
+            true,
+            1
+        );
+        const nfcPath = "café/Ångström.md";
+        const nfdPath = nfcPath.normalize("NFD");
+        const remoteMeta = createMeta(nfcPath, "remote body");
+        const existingFile = createStorageFile(nfdPath, "old body");
+        databaseFileAccess.fetchEntryMeta.mockResolvedValue(remoteMeta);
+        databaseFileAccess.fetchEntryFromMeta.mockResolvedValue({ ...remoteMeta, data: "remote body" });
+        storageAccess.getStub.mockResolvedValue(createStorageStub(nfdPath, "old body"));
+        storageAccess.readStubContent.mockResolvedValue(existingFile);
+        pathService.path2id.mockImplementation(async (path: string) => path.normalize("NFC"));
+
+        await expect(handler.dbToStorage(remoteMeta, existingFile, true)).resolves.toBe(true);
+
+        expect(pathService.path2id).toHaveBeenCalledWith(nfdPath);
+        expect(pathService.path2id).toHaveBeenCalledWith(nfcPath);
+        expect(storageAccess.renameFile).not.toHaveBeenCalled();
+        expect(provenance.delete).not.toHaveBeenCalled();
+        expect(storageAccess.writeFileAuto).toHaveBeenCalledWith(nfcPath, "remote body", {
+            ctime: remoteMeta.ctime,
+            mtime: remoteMeta.mtime,
+        });
+    });
+
+    it.each([0, 1] as const)(
+        "preserves a file when the canonical path change also changes parent directory case with path normalisation version %s",
+        async (pathNormalizationVersion) => {
+            const { handler, storageStub, databaseFileAccess, storageAccess } = createHandler(
+                "same body",
+                "same body",
+                false,
+                EVEN,
+                false,
+                pathNormalizationVersion
+            );
+            const remoteMeta = createMeta("renamed/calculus.md", "same body");
+            const existingFile = {
+                ...storageStub,
+                name: "Calculus.md",
+                path: "Renamed/Calculus.md" as FilePath,
+            };
+            databaseFileAccess.fetchEntryMeta.mockResolvedValue(remoteMeta);
+            storageAccess.getStub.mockResolvedValue(existingFile);
+
+            await expect(handler.dbToStorage(remoteMeta, existingFile)).resolves.toBe(false);
+
+            expect(storageAccess.renameFile).not.toHaveBeenCalled();
+            expect(databaseFileAccess.fetchEntryFromMeta).not.toHaveBeenCalled();
+            expect(storageAccess.writeFileAuto).not.toHaveBeenCalled();
+        }
+    );
 
     it("stops remote reflection when the canonical filename case cannot be applied", async () => {
         const { handler, storageStub, databaseFileAccess, storageAccess } = createHandler(
@@ -1257,10 +1517,10 @@ describe("ServiceFileHandlerBase.dbToStorage", () => {
         expect(databaseFileAccess.storeIndependentRevision).toHaveBeenCalledWith(
             expect.objectContaining({ path: "note.md" }), true
         );
-        expect(provenance.set).toHaveBeenCalledWith("note.md", {
+        expect(provenance.set).toHaveBeenCalledWith("note.md", expect.objectContaining({
             revision: "1-independent",
             observedStorageMtime: storageStub.stat.mtime,
-        });
+        }));
     });
 
     it("applies a remote addition without conflict when local storage is an unmodified older copy (#994)", async () => {
@@ -1368,10 +1628,10 @@ describe("ServiceFileHandlerBase.dbToStorage", () => {
 
         expect(databaseFileAccess.storeAsConflictedRevisionWithResult).not.toHaveBeenCalled();
         expect(storageAccess.writeFileAuto).not.toHaveBeenCalled();
-        expect(provenance.set).toHaveBeenCalledWith("note.md", {
+        expect(provenance.set).toHaveBeenCalledWith("note.md", expect.objectContaining({
             revision: remoteMeta._rev,
             observedStorageMtime: storageStub.stat.mtime,
-        });
+        }));
     });
 
     it("reflects the explicitly selected revision instead of refetching the winner", async () => {
@@ -1433,16 +1693,22 @@ describe("ServiceFileHandlerBase.dbToStorage", () => {
             data: "selected content",
         });
 
+        storageAccess.touched.mockImplementation(async () => {
+            storageAccess.readStubContent.mockResolvedValue(createStorageFile("note.md", "edited after reflection"));
+        });
+
         await expect(handler.dbToStorageWithSpecificRev(storageStub, selected._rev, true)).resolves.toBe(true);
 
         expect(storageAccess.writeFileAuto).toHaveBeenCalledWith("note.md", "selected content", {
             ctime: 1,
             mtime: 2,
         });
-        expect(provenance.set).toHaveBeenCalledWith("note.md", {
+        expect(provenance.set).toHaveBeenCalledWith("note.md", expect.objectContaining({
             revision: selected._rev,
             observedStorageMtime: storageStub.stat.mtime,
-        });
+            contentHash: `sha256:${createHash("sha256").update("selected content").digest("hex")}`,
+            contentSize: byteLength("selected content"),
+        }));
     });
 
     it("restores an explicitly selected revision when the Vault file is missing", async () => {
@@ -1472,10 +1738,10 @@ describe("ServiceFileHandlerBase.dbToStorage", () => {
             ctime: 1,
             mtime: 2,
         });
-        expect(provenance.set).toHaveBeenCalledWith("note.md", {
+        expect(provenance.set).toHaveBeenCalledWith("note.md", expect.objectContaining({
             revision: selected._rev,
             observedStorageMtime: 22,
-        });
+        }));
     });
 });
 
@@ -1513,9 +1779,9 @@ describe("ServiceFileHandlerBase conflicted storage operations", () => {
         conflict.queueCheckFor.mockRejectedValueOnce(new Error("conflict callback failed"));
 
         await expect(handler.storeFileToDB(storageFile)).rejects.toThrow("conflict callback failed");
-        expect(provenance.set).toHaveBeenCalledWith("note.md", {
+        expect(provenance.set).toHaveBeenCalledWith("note.md", expect.objectContaining({
             revision: "4-local-edit", observedStorageMtime: storageFile.stat.mtime
-        });
+        }));
         await expect(handler.deleteRevisionFromDB("note.md" as FilePath, "3-displayed")).resolves.toBe(true);
         expect(databaseFileAccess.delete).toHaveBeenCalledWith("note.md", "3-displayed");
     });
@@ -1790,9 +2056,9 @@ describe("ServiceFileHandlerBase conflicted storage operations", () => {
         expect(databaseFileAccess.storeWithBaseRevision).toHaveBeenCalledWith(
             expect.objectContaining({ body: current.body }), "3-displayed", true
         );
-        expect(provenance.set).toHaveBeenCalledWith("note.md", {
+        expect(provenance.set).toHaveBeenCalledWith("note.md", expect.objectContaining({
             revision: "4-local-edit", observedStorageMtime: current.stat.mtime
-        });
+        }));
         expect(storageAccess.triggerFileEvent).not.toHaveBeenCalled();
     });
 
@@ -1813,9 +2079,9 @@ describe("ServiceFileHandlerBase conflicted storage operations", () => {
             expect.objectContaining({ body: current.body }), "3-displayed", true
         );
         expect(provenance.set).toHaveBeenCalledTimes(1);
-        expect(provenance.set).toHaveBeenCalledWith("note.md", {
+        expect(provenance.set).toHaveBeenCalledWith("note.md", expect.objectContaining({
             revision: "4-local-edit", observedStorageMtime: current.stat.mtime
-        });
+        }));
     });
 
     it("reuses the current loaded entry when checking known current provenance", async () => {
@@ -1832,6 +2098,62 @@ describe("ServiceFileHandlerBase conflicted storage operations", () => {
         expect(databaseFileAccess.findLiveContentRevisions).not.toHaveBeenCalled();
         expect(storageAccess.getStub).not.toHaveBeenCalled();
         expect(databaseFileAccess.storeWithBaseRevision).toHaveBeenCalledWith(storageFile, "3-winner", true);
+    });
+
+    it.each([
+        { provenanceKind: "legacy", changeDuringHash: false },
+        { provenanceKind: "legacy", changeDuringHash: true },
+        { provenanceKind: "matching-leaf", changeDuringHash: false },
+        { provenanceKind: "matching-leaf", changeDuringHash: true },
+    ])("rechecks restored storage after provenance hashing ($provenanceKind, changed=$changeDuringHash)", async ({ provenanceKind, changeDuringHash }) => {
+        const { processFileEvent, databaseFileAccess, provenance, storageAccess } = createConflictedOperationHandler();
+        const unchanged = createStorageFile("note.md", "winner");
+        let current = unchanged;
+        let recorded: { revision: string; observedStorageMtime?: number; contentHash?: string; contentSize?: number } | undefined =
+            provenanceKind === "legacy" ? { revision: "3-winner", observedStorageMtime: 2 } : undefined;
+        provenance.get.mockImplementation(async () => recorded);
+        provenance.set.mockImplementation(async (_path, record) => { recorded = record; });
+        databaseFileAccess.findLiveContentRevisions.mockImplementation(async (_file, body: Blob) =>
+            await body.text() === "winner" ? ["3-winner"] : []
+        );
+        databaseFileAccess.getConflictedRevs.mockResolvedValue([]);
+        storageAccess.getStub.mockImplementation(async () => {
+            const { body: _body, ...stub } = current;
+            return stub;
+        });
+        storageAccess.readStubContent.mockImplementation(async () => current);
+        const read = unchanged.body.arrayBuffer.bind(unchanged.body);
+        const hashing = vi.spyOn(unchanged.body, "arrayBuffer").mockImplementationOnce(async () => {
+            if (changeDuringHash) current = createStorageFile("note.md", "edited during provenance hashing");
+            return await read();
+        });
+
+        await expect(processFileEvent(createRestoredEvent("CHANGED", unchanged))).resolves.toBe(true);
+
+        expect(hashing).toHaveBeenCalledOnce();
+        if (changeDuringHash) {
+            const writes = [
+                ...databaseFileAccess.storeWithBaseRevision.mock.calls,
+                ...databaseFileAccess.storeIndependentRevision.mock.calls,
+            ];
+            expect(writes).toHaveLength(1);
+            expect(writes[0][0]).toBe(current);
+            if (provenanceKind === "legacy") {
+                expect(databaseFileAccess.storeWithBaseRevision).toHaveBeenCalledWith(current, "3-winner", true);
+            }
+            expect(recorded?.contentHash).toBe(
+                `sha256:${createHash("sha256").update("edited during provenance hashing").digest("hex")}`
+            );
+        } else {
+            expect(databaseFileAccess.storeWithBaseRevision).not.toHaveBeenCalled();
+            expect(databaseFileAccess.storeIndependentRevision).not.toHaveBeenCalled();
+            expect(storageAccess.readStubContent).toHaveBeenCalledTimes(2);
+            expect(provenance.set).toHaveBeenCalledWith("note.md", expect.objectContaining({
+                revision: "3-winner",
+                contentHash: `sha256:${createHash("sha256").update("winner").digest("hex")}`,
+            }));
+        }
+        expect(storageAccess.triggerFileEvent).not.toHaveBeenCalled();
     });
 
     it.each([
@@ -1891,9 +2213,11 @@ describe("ServiceFileHandlerBase conflicted storage operations", () => {
             expect.objectContaining({ body: storageFile.body }), "3-displayed", true
         );
         expect(databaseFileAccess.storeIndependentRevision).not.toHaveBeenCalled();
-        expect(provenance.set).toHaveBeenCalledWith("note.md", {
-            revision: "4-local-edit", observedStorageMtime: storageFile.stat.mtime
-        });
+        expect(provenance.set).toHaveBeenCalledWith("note.md", expect.objectContaining({
+            revision: "4-local-edit", observedStorageMtime: storageFile.stat.mtime,
+            contentHash: `sha256:${createHash("sha256").update("edited displayed content").digest("hex")}`,
+            contentSize: byteLength("edited displayed content"),
+        }));
     });
 
     it("repairs chunks without consulting provenance or creating a document revision", async () => {
@@ -2018,10 +2342,10 @@ describe("ServiceFileHandlerBase conflicted storage operations", () => {
         await expect(handler.storeFileToDBWithBaseRevision(storageFile, selectedRevision)).resolves.toBe(true);
 
         expect(databaseFileAccess.storeWithBaseRevision).toHaveBeenCalledWith(storageFile, selectedRevision, true);
-        expect(provenance.set).toHaveBeenCalledWith("note.md", {
+        expect(provenance.set).toHaveBeenCalledWith("note.md", expect.objectContaining({
             revision: "4-local-edit",
             observedStorageMtime: storageFile.stat.mtime,
-        });
+        }));
         expect(conflict.queueCheckFor).toHaveBeenCalledWith("note.md");
     });
 
@@ -2053,10 +2377,10 @@ describe("ServiceFileHandlerBase conflicted storage operations", () => {
         await expect(handler.storeFileToDBWithBaseRevision(storageFile, selectedRevision, false)).resolves.toBe(true);
 
         expect(databaseFileAccess.storeWithBaseRevision).not.toHaveBeenCalled();
-        expect(provenance.set).toHaveBeenCalledWith("note.md", {
+        expect(provenance.set).toHaveBeenCalledWith("note.md", expect.objectContaining({
             revision: selectedRevision,
             observedStorageMtime: storageFile.stat.mtime,
-        });
+        }));
         expect(conflict.queueCheckFor).toHaveBeenCalledWith("note.md");
     });
 
@@ -2079,10 +2403,10 @@ describe("ServiceFileHandlerBase conflicted storage operations", () => {
 
         expect(databaseFileAccess.storeWithBaseRevision).toHaveBeenCalledWith(storageFile, displayedRevision, true);
         expect(databaseFileAccess.store).not.toHaveBeenCalled();
-        expect(provenance.set).toHaveBeenCalledWith("note.md", {
+        expect(provenance.set).toHaveBeenCalledWith("note.md", expect.objectContaining({
             revision: "4-local-edit",
             observedStorageMtime: storageFile.stat.mtime,
-        });
+        }));
     });
 
     it("keeps the recorded displayed branch when edited content also matches another branch", async () => {
@@ -2103,9 +2427,9 @@ describe("ServiceFileHandlerBase conflicted storage operations", () => {
 
         expect(databaseFileAccess.storeWithBaseRevision).not.toHaveBeenCalled();
         expect(databaseFileAccess.storeIndependentRevision).not.toHaveBeenCalled();
-        expect(provenance.set).toHaveBeenCalledWith("note.md", {
+        expect(provenance.set).toHaveBeenCalledWith("note.md", expect.objectContaining({
             revision: "3-reconstructed", observedStorageMtime: storageFile.stat.mtime
-        });
+        }));
     });
 
     it("preserves an edit as a new conflict when the displayed revision cannot be proved", async () => {
@@ -2146,9 +2470,9 @@ describe("ServiceFileHandlerBase conflicted storage operations", () => {
         await expect(handler.storeFileToDB(storageFile)).resolves.toBe(true);
 
         expect(databaseFileAccess.storeIndependentRevision).toHaveBeenCalledWith(storageFile, true);
-        expect(provenance.set).toHaveBeenCalledWith("note.md", {
+        expect(provenance.set).toHaveBeenCalledWith("note.md", expect.objectContaining({
             revision: "1-independent", observedStorageMtime: storageFile.stat.mtime
-        });
+        }));
         expect(conflict.queueCheckFor).toHaveBeenCalledWith("note.md");
     });
 
@@ -2184,10 +2508,10 @@ describe("ServiceFileHandlerBase conflicted storage operations", () => {
         expect(databaseFileAccess.storeWithBaseRevision).toHaveBeenCalledWith(renamedFile, displayedRevision, true);
         expect(databaseFileAccess.delete).not.toHaveBeenCalled();
         expect(provenance.delete).toHaveBeenCalledWith("Note.md");
-        expect(provenance.set).toHaveBeenCalledWith("note.md", {
+        expect(provenance.set).toHaveBeenCalledWith("note.md", expect.objectContaining({
             revision: "4-local-edit",
             observedStorageMtime: renamedFile.stat.mtime,
-        });
+        }));
     });
 
     it("soft-deletes only the displayed source branch for a cross-path rename", async () => {
@@ -2215,5 +2539,40 @@ describe("ServiceFileHandlerBase conflicted storage operations", () => {
         expect(databaseFileAccess.storeDeletionWithBaseRevision).not.toHaveBeenCalled();
         expect(databaseFileAccess.delete).not.toHaveBeenCalled();
         expect(conflict.queueCheckFor).toHaveBeenCalledWith("old.md");
+    });
+});
+
+
+describe("ServiceFileHandlerBase event completion decisions", () => {
+    it("completes an explicitly deselected ordinary event without writing", async () => {
+        const file = createStorageStub("excluded.md", "saved");
+        const { processFileEvent, storeFileToDB } = createRestoredEventHandler({ isTargetFile: () => false });
+        await expect(processFileEvent({ type: "CHANGED", args: { file }, key: "excluded" })).resolves.toBe(true);
+        expect(storeFileToDB).not.toHaveBeenCalled();
+    });
+
+    it("retains an ordinary event rejected only by a current path collision", async () => {
+        const file = createStorageStub("collision.md", "saved");
+        const { processFileEvent, storeFileToDB } = createRestoredEventHandler({
+            isTargetFile: () => false,
+            isTargetFileWithoutDuplication: () => true,
+        });
+        await expect(processFileEvent({ type: "CHANGED", args: { file }, key: "collision" })).resolves.toBe(false);
+        expect(storeFileToDB).not.toHaveBeenCalled();
+    });
+
+    it("completes an ordinary content event when current storage proves its file is gone", async () => {
+        const file = createStorageStub("deleted-before-save.md", "saved");
+        const { processFileEvent, storeFileToDB } = createRestoredEventHandler();
+        await expect(processFileEvent({ type: "CHANGED", args: { file }, key: "superseded" })).resolves.toBe(true);
+        expect(storeFileToDB).not.toHaveBeenCalled();
+    });
+
+    it("retains a restored deletion when selection cannot be inspected", async () => {
+        const file = createStorageStub("note.md", "saved");
+        const { processFileEvent, vault, deleteFileFromDB } = createRestoredEventHandler();
+        vault.isTargetFile.mockRejectedValue(new Error("Selection unavailable"));
+        await expect(processFileEvent(createRestoredEvent("DELETE", file))).resolves.toBe(false);
+        expect(deleteFileFromDB).not.toHaveBeenCalled();
     });
 });

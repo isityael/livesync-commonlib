@@ -371,7 +371,8 @@ async function putDBEntryInternal(
 }
 export function isTargetFile(host: NecessaryServicesInterfaces<"setting", never>, filenameSrc: string) {
     const settings = host.services.setting.currentSettings();
-    const file = filenameSrc.startsWith(ICHeader) ? filenameSrc.substring(ICHeader.length) : filenameSrc;
+    const isInternalFile = filenameSrc.startsWith(ICHeader);
+    const file = isInternalFile ? filenameSrc.substring(ICHeader.length) : filenameSrc;
     if (file.startsWith(ICXHeader)) return true;
     if (file.startsWith(PSCHeader)) return true;
     if (file.startsWith(IDPrefixes.Chunk) || file.startsWith(IDPrefixes.Obfuscated)) {
@@ -382,7 +383,7 @@ export function isTargetFile(host: NecessaryServicesInterfaces<"setting", never>
             return false;
         }
     }
-    if (settings.syncOnlyRegEx) {
+    if (!isInternalFile && settings.syncOnlyRegEx) {
         const syncOnly = getFileRegExp(settings, "syncOnlyRegEx");
         if (syncOnly.length > 0 && !syncOnly.some((e) => e.test(file))) return false;
     }
@@ -425,13 +426,35 @@ export async function getDBEntryMetaByPath(
     const id = await host.services.path.path2id(path);
     try {
         let obj: EntryDocResponse | null = null;
-        if (opt) {
-            obj = await localDatabase.get(id, opt);
-        } else {
-            obj = await localDatabase.get(id);
+        try {
+            if (opt) {
+                obj = await localDatabase.get(id, opt);
+            } else {
+                obj = await localDatabase.get(id);
+            }
+        } catch (ex) {
+            if (!includeDeleted || opt?.rev !== undefined || !isErrorOfMissingDoc(ex)) throw ex;
+            // A normal get hides a deleted winner. The keyed index still exposes
+            // its current revision, which can be read explicitly. Do not use the
+            // incoming deletion revision: a live winner may have replaced it.
+            for (let attempt = 0; attempt < 3; attempt++) {
+                const result = await localDatabase.allDocs({ keys: [id] });
+                const row = result.rows[0];
+                if (!row || !("value" in row) || !row.value.rev) return false;
+                const candidate = await localDatabase.get(id, { ...opt, rev: row.value.rev });
+                // Fetching an indexed revision can race with a restoration.
+                // Confirm the winner again before returning it as current.
+                const current = (await localDatabase.allDocs({ keys: [id] })).rows[0];
+                if (!current || !("value" in current) || !current.value.rev) return false;
+                if (current.value.rev === candidate._rev) {
+                    obj = candidate;
+                    break;
+                }
+            }
+            // Continuous changes cannot establish a current revision safely.
+            if (!obj) return false;
         }
-        const deleted: boolean | undefined =
-            (obj as unknown as { deleted?: boolean })?.deleted ?? obj._deleted ?? undefined;
+        const deleted: boolean | undefined = obj._deleted || (obj as unknown as { deleted?: boolean }).deleted;
         if (!includeDeleted && deleted) return false;
         if (obj.type && obj.type == "leaf") {
             //do nothing for leaf;
