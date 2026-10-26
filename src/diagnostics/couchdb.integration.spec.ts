@@ -163,7 +163,7 @@ describe("CouchDB diagnostic reader integration", () => {
 
     it("reads encrypted records with the existing Security Seed and stays read-only", async () => {
         const serverInfo = await getJSON<{ version?: string }>(new URL("/", hostname).toString());
-        expect(serverInfo.version).toBe("3.5.0");
+        expect(serverInfo.version).toBe("3.5.3");
 
         let databaseCreated = false;
         let closeSource: (() => Promise<void>) | undefined;

@@ -2,7 +2,7 @@ name: livesync-commonlib-integration
 
 services:
   couchdb:
-    image: couchdb:3.5.0
+    image: couchdb:3.5.3
     environment:
       COUCHDB_USER: admin
       COUCHDB_PASSWORD: testpassword
@@ -19,7 +19,7 @@ services:
       - "9000:9000"
 
   minio-init:
-    image: rustfs/rc:v0.1.35@sha256:adb45b56539006120f1d790bcc17ee5f9b4d93c1d7e71ed0a24f10267f9d6914
+    image: rustfs/rc:v0.1.36@sha256:ab024bfebee49a750ce886b4c70963ccd9ddaa03f491704a90710641d7a26699
     depends_on:
       - minio
     entrypoint:
