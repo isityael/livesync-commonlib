@@ -57,8 +57,8 @@ importers:
         specifier: ^15.0.2
         version: 15.0.3
       minimatch:
-        specifier: ^10.2.6
-        version: 10.2.6
+        specifier: ^11.0.0
+        version: 11.0.0
       octagonal-wheels:
         specifier: ^0.1.55
         version: 0.1.55
@@ -405,6 +405,9 @@ packages:
     engines: {node: '>=18'}
     cpu: [x64]
     os: [win32]
+
+  '@isaacs/nonrecursive-glob-match@1.0.1':
+    resolution: {integrity: sha512-rNKPuTXBacPpn5+CP+S3/UI6uq/0jHZjPpaBLaRE3blpgX+E+ZUIrGfViPvUjUnQG6W1+3OTFUiVRCjTffs2+Q==}
 
   '@jridgewell/gen-mapping@0.3.13':
     resolution: {integrity: sha512-2kkt/7niJ6MgEPxF0bYdQ6etZaA+fQvDcLKckhy1yIQOzaoKjBBjSj63/aLVjYE3qhRt5dvM+uUyfCg6UKCBbA==}
@@ -1126,8 +1129,8 @@ packages:
     resolution: {integrity: sha512-iVrGHZB8i4OQfM155xx8akvG9FIj+ht14DX5CQkCTG4EHzZ3d3sgckIf/Lm9ivZalEsFuEVnWv2B2WZvbrro2w==}
     deprecated: Superseded by memory-level (https://github.com/Level/community#faq)
 
-  minimatch@10.2.6:
-    resolution: {integrity: sha512-vpLQEs+VLCr1nU0BXS07maYoFwlDAH0gngQuuttxIwutDFEMHq2blX+8vpgxDdK3J1PwjCJiep77OitTZ4Ll1A==}
+  minimatch@11.0.0:
+    resolution: {integrity: sha512-/4ymzTLZ2FkgyGY+Gp644J3l4OS+mnWGKVH+Y7r8DcOeUreCtc75sE9mCUrbwOJh4pQC3J4pfBo8mulOoaytIA==}
     engines: {node: 18 || 20 || >=22}
 
   nanoid@3.3.20:
@@ -1756,6 +1759,8 @@ snapshots:
 
   '@esbuild/win32-x64@0.28.2':
     optional: true
+
+  '@isaacs/nonrecursive-glob-match@1.0.1': {}
 
   '@jridgewell/gen-mapping@0.3.13':
     dependencies:
@@ -2390,8 +2395,9 @@ snapshots:
       ltgt: 2.2.1
       safe-buffer: 5.1.2
 
-  minimatch@10.2.6:
+  minimatch@11.0.0:
     dependencies:
+      '@isaacs/nonrecursive-glob-match': 1.0.1
       brace-expansion: 5.0.12
 
   nanoid@3.3.20: {}
