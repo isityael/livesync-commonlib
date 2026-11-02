@@ -6,7 +6,7 @@ when:
 
 steps:
   - name: verify-package
-    image: dhi.io/node:26.13.0-alpine3.24-dev@sha256:4f971dcdc1fdf59f9d3e84dbd529690c2d15f75ae898fb310acad9c12d7bbdf9
+    image: dhi.io/node:26.13.0-alpine3.24-dev
     commands:
       - npm ci --ignore-scripts --no-audit --no-fund
       - npm run verify:package

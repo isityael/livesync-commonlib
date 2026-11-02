@@ -24,7 +24,9 @@
     {
       "customType": "regex",
       "description": "Deno import map npm: specifiers in deno.jsonc",
-      "managerFilePatterns": ["/deno\\.jsonc?$/"],
+      "managerFilePatterns": [
+        "/deno\\.jsonc?$/"
+      ],
       "matchStrings": [
         "\"npm:(?<depName>(?:@[^/]+/)?[^@]+)@(?<currentValue>[^\"]+)\""
       ],
@@ -33,7 +35,9 @@
     {
       "customType": "regex",
       "description": "Deno import map jsr: specifiers in deno.jsonc",
-      "managerFilePatterns": ["/deno\\.jsonc?$/"],
+      "managerFilePatterns": [
+        "/deno\\.jsonc?$/"
+      ],
       "matchStrings": [
         "\"jsr:(?<depName>@[^@/]+/[^@/@]+)@(?<currentValue>[^\"/@]+)"
       ],
@@ -71,6 +75,28 @@
         "minor"
       ],
       "automerge": true
+    },
+    {
+      "description": "Use container version tags only.",
+      "matchDatasources": [
+        "docker"
+      ],
+      "pinDigests": false
+    },
+    {
+      "description": "Do not create container digest pins or digest refreshes.",
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchUpdateTypes": [
+        "digest",
+        "pinDigest"
+      ],
+      "enabled": false
     }
+  ],
+  "pinDigests": false,
+  "ignorePresets": [
+    "docker:pinDigests"
   ]
 }
